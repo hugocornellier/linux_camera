@@ -1,0 +1,222 @@
+#include "device_enumerator.h"
+
+#include <fcntl.h>
+#include <linux/videodev2.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cstring>
+#include <set>
+
+static const int kMaxDeviceIndex = 64;
+static const int kMinFps = 15;
+
+// Standard resolutions to probe when the device reports stepwise/continuous
+// frame sizes instead of discrete sizes.
+static const int kStandardHeights[] = {240, 480, 720, 1080, 2160};
+static const int kStandardWidths[] = {320, 640, 1280, 1920, 3840};
+
+// Maximum height per resolution preset.
+static int MaxHeightForPreset(int preset) {
+  switch (preset) {
+    case ResolutionPreset::kLow:
+      return 240;
+    case ResolutionPreset::kMedium:
+      return 480;
+    case ResolutionPreset::kHigh:
+      return 720;
+    case ResolutionPreset::kVeryHigh:
+      return 1080;
+    case ResolutionPreset::kUltraHigh:
+      return 2160;
+    case ResolutionPreset::kMax:
+    default:
+      return 99999;
+  }
+}
+
+// Queries the maximum FPS for a given format and resolution via
+// VIDIOC_ENUM_FRAMEINTERVALS. Returns 0 if it cannot be determined.
+static int QueryMaxFps(int fd, __u32 pixel_format, int width, int height) {
+  struct v4l2_frmivalenum frmival;
+  memset(&frmival, 0, sizeof(frmival));
+  frmival.pixel_format = pixel_format;
+  frmival.width = width;
+  frmival.height = height;
+  frmival.index = 0;
+
+  int max_fps = 0;
+  while (ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &frmival) == 0) {
+    if (frmival.type == V4L2_FRMIVAL_TYPE_DISCRETE) {
+      if (frmival.discrete.numerator > 0) {
+        int fps = frmival.discrete.denominator / frmival.discrete.numerator;
+        if (fps > max_fps) max_fps = fps;
+      }
+    } else if (frmival.type == V4L2_FRMIVAL_TYPE_STEPWISE ||
+               frmival.type == V4L2_FRMIVAL_TYPE_CONTINUOUS) {
+      // Use the minimum interval (= maximum fps).
+      if (frmival.stepwise.min.numerator > 0) {
+        int fps =
+            frmival.stepwise.min.denominator / frmival.stepwise.min.numerator;
+        if (fps > max_fps) max_fps = fps;
+      }
+      break;  // Only one entry for stepwise/continuous.
+    }
+    frmival.index++;
+  }
+  return max_fps > 0 ? max_fps : 30;  // Default to 30 if unknown.
+}
+
+std::vector<DeviceInfo> DeviceEnumerator::EnumerateDevices() {
+  std::vector<DeviceInfo> devices;
+  std::set<std::string> seen_bus_info;
+
+  for (int i = 0; i < kMaxDeviceIndex; i++) {
+    char path[32];
+    snprintf(path, sizeof(path), "/dev/video%d", i);
+
+    int fd = open(path, O_RDONLY | O_NONBLOCK);
+    if (fd < 0) continue;
+
+    struct v4l2_capability cap;
+    memset(&cap, 0, sizeof(cap));
+    if (ioctl(fd, VIDIOC_QUERYCAP, &cap) != 0) {
+      close(fd);
+      continue;
+    }
+
+    // Use per-node device_caps when available, otherwise fall back to
+    // device-wide capabilities.
+    __u32 effective_caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS)
+                               ? cap.device_caps
+                               : cap.capabilities;
+
+    // Must support video capture (single-plane or multi-plane).
+    bool is_capture =
+        (effective_caps &
+         (V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_CAPTURE_MPLANE)) != 0;
+
+    // Filter out non-camera nodes (M2M, metadata, output-only).
+    bool is_non_camera =
+        (effective_caps & (V4L2_CAP_VIDEO_M2M | V4L2_CAP_VIDEO_M2M_MPLANE |
+                           V4L2_CAP_META_CAPTURE | V4L2_CAP_VIDEO_OUTPUT)) !=
+        0;
+
+    if (!is_capture || is_non_camera) {
+      close(fd);
+      continue;
+    }
+
+    // Deduplicate by bus_info — each physical camera may expose multiple nodes.
+    std::string bus(reinterpret_cast<const char*>(cap.bus_info));
+    if (!bus.empty() && seen_bus_info.count(bus)) {
+      close(fd);
+      continue;
+    }
+    if (!bus.empty()) seen_bus_info.insert(bus);
+
+    DeviceInfo info;
+    info.device_path = path;
+    info.name = reinterpret_cast<const char*>(cap.card);
+    info.bus_info = bus;
+    // Most Linux webcams are external USB cameras.
+    info.lens_direction = 2;  // CameraLensDirection.external
+    info.sensor_orientation = 0;
+    devices.push_back(info);
+
+    close(fd);
+  }
+  return devices;
+}
+
+std::vector<ResolutionInfo> DeviceEnumerator::EnumerateResolutions(
+    const std::string& device_path) {
+  std::vector<ResolutionInfo> resolutions;
+
+  int fd = open(device_path.c_str(), O_RDONLY | O_NONBLOCK);
+  if (fd < 0) return resolutions;
+
+  struct v4l2_fmtdesc fmt;
+  memset(&fmt, 0, sizeof(fmt));
+  fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  fmt.index = 0;
+
+  // Track seen width×height pairs to avoid duplicates across formats.
+  std::set<std::pair<int, int>> seen;
+
+  while (ioctl(fd, VIDIOC_ENUM_FMT, &fmt) == 0) {
+    struct v4l2_frmsizeenum frmsize;
+    memset(&frmsize, 0, sizeof(frmsize));
+    frmsize.pixel_format = fmt.pixelformat;
+    frmsize.index = 0;
+
+    while (ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) == 0) {
+      if (frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
+        int w = frmsize.discrete.width;
+        int h = frmsize.discrete.height;
+        if (!seen.count({w, h})) {
+          seen.insert({w, h});
+          int fps = QueryMaxFps(fd, fmt.pixelformat, w, h);
+          resolutions.push_back({w, h, fps});
+        }
+      } else if (frmsize.type == V4L2_FRMSIZE_TYPE_STEPWISE ||
+                 frmsize.type == V4L2_FRMSIZE_TYPE_CONTINUOUS) {
+        // Generate standard resolutions within the reported range.
+        for (int si = 0; si < 5; si++) {
+          int w = kStandardWidths[si];
+          int h = kStandardHeights[si];
+          if (w >= (int)frmsize.stepwise.min_width &&
+              w <= (int)frmsize.stepwise.max_width &&
+              h >= (int)frmsize.stepwise.min_height &&
+              h <= (int)frmsize.stepwise.max_height &&
+              !seen.count({w, h})) {
+            seen.insert({w, h});
+            int fps = QueryMaxFps(fd, fmt.pixelformat, w, h);
+            resolutions.push_back({w, h, fps});
+          }
+        }
+        break;  // One entry for stepwise/continuous.
+      }
+      frmsize.index++;
+    }
+    fmt.index++;
+  }
+
+  close(fd);
+
+  // Sort by resolution (height primary, width secondary) descending.
+  std::sort(resolutions.begin(), resolutions.end(),
+            [](const ResolutionInfo& a, const ResolutionInfo& b) {
+              if (a.height != b.height) return a.height > b.height;
+              return a.width > b.width;
+            });
+
+  return resolutions;
+}
+
+ResolutionInfo DeviceEnumerator::SelectResolution(
+    const std::vector<ResolutionInfo>& resolutions,
+    int preset) {
+  int max_height = MaxHeightForPreset(preset);
+
+  // Find the highest resolution that fits within the preset ceiling and
+  // has at least kMinFps. Resolutions are sorted descending.
+  for (const auto& r : resolutions) {
+    if (r.height <= max_height && r.max_fps >= kMinFps) {
+      return r;
+    }
+  }
+  // Fallback: relax FPS requirement.
+  for (const auto& r : resolutions) {
+    if (r.height <= max_height) {
+      return r;
+    }
+  }
+  // Absolute fallback: return the lowest resolution available.
+  if (!resolutions.empty()) {
+    return resolutions.back();
+  }
+  // No resolutions found — return a default and let GStreamer negotiate.
+  return {640, 480, 30};
+}

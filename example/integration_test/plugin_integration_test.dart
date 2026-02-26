@@ -1,24 +1,21 @@
-// This is a basic Flutter integration test.
-//
-// Since integration tests run in a full Flutter application, they can interact
-// with the host side of a plugin implementation, unlike Dart unit tests.
-//
-// For more information about Flutter integration tests, please see
-// https://flutter.dev/to/integration-testing
-
+import 'package:camera_platform_interface/camera_platform_interface.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
-
-import 'package:linux_camera/linux_camera.dart';
+import 'package:camera_desktop/camera_desktop.dart';
 
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
 
-  testWidgets('getPlatformVersion test', (WidgetTester tester) async {
-    final LinuxCamera plugin = LinuxCamera();
-    final String? version = await plugin.getPlatformVersion();
-    // The version string depends on the host platform running the test, so
-    // just assert that some non-empty string is returned.
-    expect(version?.isNotEmpty, true);
+  testWidgets('CameraDesktopPlugin is registered as CameraPlatform', (
+    WidgetTester tester,
+  ) async {
+    // On Linux, CameraDesktopPlugin should be auto-registered via registerWith().
+    expect(CameraPlatform.instance, isA<CameraDesktopPlugin>());
+  });
+
+  testWidgets('availableCameras returns a list', (WidgetTester tester) async {
+    final cameras = await CameraPlatform.instance.availableCameras();
+    // On a machine with no cameras this may be empty, but it shouldn't throw.
+    expect(cameras, isA<List<CameraDescription>>());
   });
 }

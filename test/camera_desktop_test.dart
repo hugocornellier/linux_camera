@@ -1,0 +1,253 @@
+import 'package:camera_platform_interface/camera_platform_interface.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:camera_desktop/camera_desktop.dart';
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  group('CameraDesktopPlugin', () {
+    late CameraDesktopPlugin plugin;
+    late MethodChannel channel;
+    final List<MethodCall> log = <MethodCall>[];
+
+    setUp(() {
+      channel = const MethodChannel('plugins.flutter.io/camera_desktop');
+      plugin = CameraDesktopPlugin(channel: channel);
+      log.clear;
+
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (MethodCall call) async {
+            log.add(call);
+            switch (call.method) {
+              case 'availableCameras':
+                return <Map<String, dynamic>>[
+                  {
+                    'name': 'Test Camera (/dev/video0)',
+                    'lensDirection': 2,
+                    'sensorOrientation': 0,
+                  },
+                ];
+              case 'create':
+                return {'cameraId': 1, 'textureId': 42};
+              case 'initialize':
+                return {'previewWidth': 1280.0, 'previewHeight': 720.0};
+              case 'takePicture':
+                return '/tmp/test.jpg';
+              case 'startVideoRecording':
+                return null;
+              case 'stopVideoRecording':
+                return '/tmp/test_video.mp4';
+              case 'startImageStream':
+              case 'stopImageStream':
+              case 'dispose':
+              case 'pausePreview':
+              case 'resumePreview':
+                return null;
+              default:
+                return null;
+            }
+          });
+    });
+
+    tearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null);
+    });
+
+    test('registerWith sets CameraPlatform.instance', () {
+      CameraDesktopPlugin.registerWith();
+      expect(CameraPlatform.instance, isA<CameraDesktopPlugin>());
+    });
+
+    test('availableCameras returns camera list', () async {
+      final cameras = await plugin.availableCameras();
+      expect(cameras, hasLength(1));
+      expect(cameras.first.name, contains('Test Camera'));
+      expect(cameras.first.lensDirection, CameraLensDirection.external);
+    });
+
+    test('createCameraWithSettings returns cameraId', () async {
+      const description = CameraDescription(
+        name: 'Test Camera (/dev/video0)',
+        lensDirection: CameraLensDirection.external,
+        sensorOrientation: 0,
+      );
+      final cameraId = await plugin.createCameraWithSettings(
+        description,
+        const MediaSettings(resolutionPreset: ResolutionPreset.high),
+      );
+      expect(cameraId, 1);
+      expect(log.last.method, 'create');
+    });
+
+    test('initializeCamera fires CameraInitializedEvent', () async {
+      // Create first so textureId mapping exists.
+      const description = CameraDescription(
+        name: 'Test Camera (/dev/video0)',
+        lensDirection: CameraLensDirection.external,
+        sensorOrientation: 0,
+      );
+      final cameraId = await plugin.createCameraWithSettings(
+        description,
+        const MediaSettings(resolutionPreset: ResolutionPreset.high),
+      );
+
+      // Listen for the initialized event.
+      final eventFuture = plugin.onCameraInitialized(cameraId).first;
+      await plugin.initializeCamera(cameraId);
+      final event = await eventFuture;
+
+      expect(event.cameraId, cameraId);
+      expect(event.previewWidth, 1280.0);
+      expect(event.previewHeight, 720.0);
+    });
+
+    test('buildPreview returns Texture widget', () async {
+      const description = CameraDescription(
+        name: 'Test Camera (/dev/video0)',
+        lensDirection: CameraLensDirection.external,
+        sensorOrientation: 0,
+      );
+      final cameraId = await plugin.createCameraWithSettings(
+        description,
+        const MediaSettings(resolutionPreset: ResolutionPreset.high),
+      );
+
+      final widget = plugin.buildPreview(cameraId);
+      expect(widget, isA<Texture>());
+    });
+
+    test('takePicture returns XFile', () async {
+      const description = CameraDescription(
+        name: 'Test Camera (/dev/video0)',
+        lensDirection: CameraLensDirection.external,
+        sensorOrientation: 0,
+      );
+      final cameraId = await plugin.createCameraWithSettings(
+        description,
+        const MediaSettings(resolutionPreset: ResolutionPreset.high),
+      );
+      await plugin.initializeCamera(cameraId);
+
+      final file = await plugin.takePicture(cameraId);
+      expect(file.path, '/tmp/test.jpg');
+    });
+
+    test('dispose calls native dispose', () async {
+      const description = CameraDescription(
+        name: 'Test Camera (/dev/video0)',
+        lensDirection: CameraLensDirection.external,
+        sensorOrientation: 0,
+      );
+      final cameraId = await plugin.createCameraWithSettings(
+        description,
+        const MediaSettings(resolutionPreset: ResolutionPreset.high),
+      );
+      await plugin.dispose(cameraId);
+      expect(log.last.method, 'dispose');
+    });
+
+    test('startVideoRecording calls native method', () async {
+      const description = CameraDescription(
+        name: 'Test Camera (/dev/video0)',
+        lensDirection: CameraLensDirection.external,
+        sensorOrientation: 0,
+      );
+      final cameraId = await plugin.createCameraWithSettings(
+        description,
+        const MediaSettings(resolutionPreset: ResolutionPreset.high),
+      );
+      await plugin.initializeCamera(cameraId);
+      await plugin.startVideoRecording(cameraId);
+      expect(log.last.method, 'startVideoRecording');
+    });
+
+    test('stopVideoRecording returns XFile', () async {
+      const description = CameraDescription(
+        name: 'Test Camera (/dev/video0)',
+        lensDirection: CameraLensDirection.external,
+        sensorOrientation: 0,
+      );
+      final cameraId = await plugin.createCameraWithSettings(
+        description,
+        const MediaSettings(resolutionPreset: ResolutionPreset.high),
+      );
+      await plugin.initializeCamera(cameraId);
+      await plugin.startVideoRecording(cameraId);
+      final file = await plugin.stopVideoRecording(cameraId);
+      expect(file.path, '/tmp/test_video.mp4');
+    });
+
+    test('supportsImageStreaming returns true', () {
+      expect(plugin.supportsImageStreaming(), isTrue);
+    });
+
+    test('onStreamedFrameAvailable starts and stops stream', () async {
+      const description = CameraDescription(
+        name: 'Test Camera (/dev/video0)',
+        lensDirection: CameraLensDirection.external,
+        sensorOrientation: 0,
+      );
+      final cameraId = await plugin.createCameraWithSettings(
+        description,
+        const MediaSettings(resolutionPreset: ResolutionPreset.high),
+      );
+
+      final stream = plugin.onStreamedFrameAvailable(cameraId);
+      final subscription = stream.listen((_) {});
+      // Starting the stream should have called startImageStream.
+      await Future<void>.delayed(Duration.zero);
+      expect(log.last.method, 'startImageStream');
+
+      await subscription.cancel();
+      await Future<void>.delayed(Duration.zero);
+      expect(log.last.method, 'stopImageStream');
+    });
+
+    test('setFlashMode off is no-op, others throw', () async {
+      // FlashMode.off is silently accepted.
+      await plugin.setFlashMode(1, FlashMode.off);
+      // Non-off flash modes throw.
+      expect(
+        () => plugin.setFlashMode(1, FlashMode.torch),
+        throwsA(isA<CameraException>()),
+      );
+    });
+
+    test('setExposureMode auto is no-op, locked throws', () async {
+      await plugin.setExposureMode(1, ExposureMode.auto);
+      expect(
+        () => plugin.setExposureMode(1, ExposureMode.locked),
+        throwsA(isA<CameraException>()),
+      );
+    });
+
+    test('setFocusMode auto is no-op, locked throws', () async {
+      await plugin.setFocusMode(1, FocusMode.auto);
+      expect(
+        () => plugin.setFocusMode(1, FocusMode.locked),
+        throwsA(isA<CameraException>()),
+      );
+    });
+
+    test('unsupported methods throw CameraException', () async {
+      expect(
+        () => plugin.pauseVideoRecording(1),
+        throwsA(isA<CameraException>()),
+      );
+    });
+
+    test('zoom returns 1.0 bounds', () async {
+      expect(await plugin.getMinZoomLevel(1), 1.0);
+      expect(await plugin.getMaxZoomLevel(1), 1.0);
+    });
+
+    test('exposure offset returns 0.0', () async {
+      expect(await plugin.getMinExposureOffset(1), 0.0);
+      expect(await plugin.getMaxExposureOffset(1), 0.0);
+      expect(await plugin.getExposureOffsetStepSize(1), 0.0);
+    });
+  });
+}

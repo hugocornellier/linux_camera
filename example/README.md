@@ -1,6 +1,6 @@
-# linux_camera_example
+# camera_desktop_example
 
-Demonstrates how to use the linux_camera plugin.
+Demonstrates how to use the camera_desktop plugin.
 
 ## Getting Started
 

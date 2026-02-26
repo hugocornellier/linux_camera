@@ -4,10 +4,10 @@ project(runner LANGUAGES CXX)
 
 # The name of the executable created for the application. Change this to change
 # the on-disk name of your application.
-set(BINARY_NAME "linux_camera_example")
+set(BINARY_NAME "camera_desktop_example")
 # The unique GTK application identifier for this application. See:
 # https://wiki.gnome.org/HowDoI/ChooseApplicationID
-set(APPLICATION_ID "com.hugocornellier.linux_camera")
+set(APPLICATION_ID "com.hugocornellier.camera_desktop")
 
 # Explicitly opt in to modern CMake behaviors to avoid warnings with recent
 # versions of CMake.
@@ -70,7 +70,7 @@ set_target_properties(${BINARY_NAME}
 )
 
 # Enable the test target.
-set(include_linux_camera_tests TRUE)
+set(include_camera_desktop_tests TRUE)
 
 # Generated plugin build rules, which manage building the plugins and adding
 # them to the application.
