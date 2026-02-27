@@ -22,6 +22,7 @@ Camera::Camera(int camera_id,
       pipeline_(nullptr),
       tee_(nullptr),
       appsink_(nullptr),
+      videoflip_(nullptr),
       bus_watch_id_(0),
       init_timeout_id_(0),
       record_handler_(std::make_unique<RecordHandler>()),
@@ -94,7 +95,7 @@ bool Camera::BuildPipeline(GError** error) {
   gchar* pipeline_str = g_strdup_printf(
       "v4l2src device=%s "
       "! videoconvert "
-      "! videoflip method=horizontal-flip "
+      "! videoflip name=flip method=horizontal-flip "
       "! video/x-raw,format=RGBA,width=%d,height=%d "
       "! tee name=t "
       "t. ! queue name=preview_queue ! "
@@ -121,6 +122,12 @@ bool Camera::BuildPipeline(GError** error) {
   }
   // Release our ref (pipeline holds one).
   gst_object_unref(tee_);
+
+  // Get the videoflip element for runtime mirror toggling.
+  videoflip_ = gst_bin_get_by_name(GST_BIN(pipeline_), "flip");
+  if (videoflip_) {
+    gst_object_unref(videoflip_);  // Pipeline holds the ref.
+  }
 
   // Get the appsink element.
   appsink_ = gst_bin_get_by_name(GST_BIN(pipeline_), "sink");
@@ -235,57 +242,92 @@ GstFlowReturn Camera::OnNewSample(GstAppSink* sink, gpointer user_data) {
 
   // Send frame to Dart image stream if streaming is active.
   if (self->image_streaming_) {
-    size_t frame_size = (size_t)width * height * 4;
-    uint8_t* frame_copy = (uint8_t*)g_malloc(frame_size);
-    if (stride == width * 4) {
-      memcpy(frame_copy, map.data, frame_size);
-    } else {
-      for (int row = 0; row < height; row++) {
-        memcpy(frame_copy + row * width * 4, map.data + row * stride,
-               width * 4);
+    if (self->image_stream_callback_) {
+      // FFI path: write to shared buffer, notify Dart directly.
+      size_t frame_size = (size_t)width * height * 4;
+      size_t total_size = offsetof(Camera::ImageStreamBuffer, pixels) + frame_size;
+
+      if (self->image_stream_buffer_size_ < total_size) {
+        g_free(self->image_stream_buffer_);
+        self->image_stream_buffer_ =
+            (Camera::ImageStreamBuffer*)g_malloc(total_size);
+        self->image_stream_buffer_size_ = total_size;
       }
+
+      auto* buf = self->image_stream_buffer_;
+      buf->ready = 0;
+
+      if (stride == width * 4) {
+        memcpy(buf->pixels, map.data, frame_size);
+      } else {
+        for (int row = 0; row < height; row++) {
+          memcpy(buf->pixels + row * width * 4, map.data + row * stride,
+                 width * 4);
+        }
+      }
+
+      buf->width = width;
+      buf->height = height;
+      buf->bytes_per_row = width * 4;
+      buf->format = 1;  // RGBA (Linux GStreamer pipeline)
+      buf->sequence = ++self->image_stream_sequence_;
+      buf->ready = 1;
+
+      self->image_stream_callback_(self->camera_id_);
+    } else {
+      // Legacy MethodChannel fallback path.
+      size_t frame_size = (size_t)width * height * 4;
+      uint8_t* frame_copy = (uint8_t*)g_malloc(frame_size);
+      if (stride == width * 4) {
+        memcpy(frame_copy, map.data, frame_size);
+      } else {
+        for (int row = 0; row < height; row++) {
+          memcpy(frame_copy + row * width * 4, map.data + row * stride,
+                 width * 4);
+        }
+      }
+
+      struct ImageStreamData {
+        FlMethodChannel* channel;
+        int camera_id;
+        uint8_t* pixels;
+        int width;
+        int height;
+        size_t size;
+      };
+
+      auto* stream_data = new ImageStreamData();
+      stream_data->channel = self->method_channel_;
+      stream_data->camera_id = self->camera_id_;
+      stream_data->pixels = frame_copy;
+      stream_data->width = width;
+      stream_data->height = height;
+      stream_data->size = frame_size;
+
+      g_idle_add(
+          [](gpointer user_data) -> gboolean {
+            auto* data = static_cast<ImageStreamData*>(user_data);
+
+            g_autoptr(FlValue) args = fl_value_new_map();
+            fl_value_set_string_take(args, "cameraId",
+                                     fl_value_new_int(data->camera_id));
+            fl_value_set_string_take(args, "width",
+                                     fl_value_new_int(data->width));
+            fl_value_set_string_take(args, "height",
+                                     fl_value_new_int(data->height));
+            fl_value_set_string_take(
+                args, "bytes",
+                fl_value_new_uint8_list(data->pixels, data->size));
+
+            fl_method_channel_invoke_method(data->channel, "imageStreamFrame",
+                                            args, nullptr, nullptr, nullptr);
+
+            g_free(data->pixels);
+            delete data;
+            return G_SOURCE_REMOVE;
+          },
+          stream_data);
     }
-
-    struct ImageStreamData {
-      FlMethodChannel* channel;
-      int camera_id;
-      uint8_t* pixels;
-      int width;
-      int height;
-      size_t size;
-    };
-
-    auto* stream_data = new ImageStreamData();
-    stream_data->channel = self->method_channel_;
-    stream_data->camera_id = self->camera_id_;
-    stream_data->pixels = frame_copy;
-    stream_data->width = width;
-    stream_data->height = height;
-    stream_data->size = frame_size;
-
-    g_idle_add(
-        [](gpointer user_data) -> gboolean {
-          auto* data = static_cast<ImageStreamData*>(user_data);
-
-          g_autoptr(FlValue) args = fl_value_new_map();
-          fl_value_set_string_take(args, "cameraId",
-                                   fl_value_new_int(data->camera_id));
-          fl_value_set_string_take(args, "width",
-                                   fl_value_new_int(data->width));
-          fl_value_set_string_take(args, "height",
-                                   fl_value_new_int(data->height));
-          fl_value_set_string_take(
-              args, "bytes",
-              fl_value_new_uint8_list(data->pixels, data->size));
-
-          fl_method_channel_invoke_method(data->channel, "imageStreamFrame",
-                                          args, nullptr, nullptr, nullptr);
-
-          g_free(data->pixels);
-          delete data;
-          return G_SOURCE_REMOVE;
-        },
-        stream_data);
   }
 
   gst_buffer_unmap(buffer, &map);
@@ -464,12 +506,26 @@ void Camera::StopImageStream() {
   image_streaming_ = false;
 }
 
+void Camera::RegisterImageStreamCallback(void (*callback)(int32_t)) {
+  image_stream_callback_ = callback;
+}
+
+void Camera::UnregisterImageStreamCallback() {
+  image_stream_callback_ = nullptr;
+}
+
 void Camera::PausePreview() {
   preview_paused_ = true;
 }
 
 void Camera::ResumePreview() {
   preview_paused_ = false;
+}
+
+void Camera::SetMirror(bool mirrored) {
+  if (!videoflip_) return;
+  // GstVideoFlipMethod: 0 = none (identity), 4 = horizontal-flip
+  g_object_set(videoflip_, "method", mirrored ? 4 : 0, nullptr);
 }
 
 void Camera::Dispose() {
@@ -483,8 +539,17 @@ void Camera::Dispose() {
     RespondToPendingInit(false, "Camera disposed during initialization");
   }
 
+  // Clean up FFI image stream buffer.
+  image_stream_callback_ = nullptr;
+  if (image_stream_buffer_) {
+    g_free(image_stream_buffer_);
+    image_stream_buffer_ = nullptr;
+    image_stream_buffer_size_ = 0;
+  }
+
   // Stop the pipeline.
   if (pipeline_) {
+    videoflip_ = nullptr;
     gst_element_set_state(pipeline_, GST_STATE_NULL);
     if (bus_watch_id_ > 0) {
       g_source_remove(bus_watch_id_);

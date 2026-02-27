@@ -60,6 +60,12 @@ class Camera {
 
   void StartImageStream();
   void StopImageStream();
+
+  // FFI image stream access.
+  void* GetImageStreamBuffer();
+  void RegisterImageStreamCallback(void (*callback)(int32_t));
+  void UnregisterImageStreamCallback();
+
   void PausePreview();
   void ResumePreview();
   void Dispose();
@@ -78,10 +84,8 @@ class Camera {
   // Applied after photo / recorder copies, for the Flutter texture only.
   static void SwapRBChannels(uint8_t* data, int width, int height);
 
-  // P6: image-stream delivery thread.
-  void ImageStreamLoop();
-
   void PostImageStreamFrame(const uint8_t* data, int width, int height);
+  void ImageStreamLoop();
   void SendError(const std::string& description);
 
   int camera_id_;
@@ -127,14 +131,32 @@ class Camera {
   std::condition_variable init_timeout_cancel_cv_;
   bool                    init_timeout_cancelled_ = false;
 
-  // ── Image stream delivery (P6) ───────────────────────────────────────────
+  // ── Image stream delivery ─────────────────────────────────────────────
+  struct ImageStreamBuffer {
+    int64_t  sequence;
+    int32_t  width;
+    int32_t  height;
+    int32_t  bytes_per_row;
+    int32_t  format;       // 0=BGRA, 1=RGBA
+    int32_t  ready;        // 1=Dart may read, 0=native writing
+    int32_t  _pad;
+    uint8_t  pixels[];     // flexible array member
+  };
+
+  // FFI shared buffer (replaces MethodChannel slot for FFI-enabled consumers).
+  ImageStreamBuffer* image_stream_buffer_ = nullptr;
+  size_t image_stream_buffer_size_ = 0;
+  void (*image_stream_callback_)(int32_t) = nullptr;
+  int64_t image_stream_sequence_ = 0;
+  std::mutex image_stream_ffi_mutex_;
+
+  // Legacy MethodChannel delivery (used when no FFI callback is registered).
   struct ImageStreamSlot {
     std::vector<uint8_t> data;
     int  width  = 0;
     int  height = 0;
     bool dirty  = false;
   };
-
   std::mutex              image_stream_mutex_;
   std::condition_variable image_stream_cv_;
   ImageStreamSlot         image_stream_slot_;

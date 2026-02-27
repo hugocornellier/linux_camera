@@ -141,6 +141,15 @@ static Camera* find_camera(CameraDesktopPlugin* self,
   return it->second.get();
 }
 
+// Exported for FFI bridge (image_stream_ffi.cc).
+extern "C" Camera* camera_desktop_find_camera_by_id(
+    CameraDesktopPlugin* plugin, int camera_id) {
+  if (!plugin || !plugin->data) return nullptr;
+  auto it = plugin->data->cameras.find(camera_id);
+  if (it == plugin->data->cameras.end()) return nullptr;
+  return it->second.get();
+}
+
 static void handle_initialize(CameraDesktopPlugin* self,
                               FlMethodCall* method_call) {
   Camera* camera = find_camera(self, method_call);
@@ -202,6 +211,19 @@ static void handle_resume_preview(CameraDesktopPlugin* self,
   fl_method_call_respond_success(method_call, fl_value_new_null(), nullptr);
 }
 
+static void handle_set_mirror(CameraDesktopPlugin* self,
+                              FlMethodCall* method_call) {
+  Camera* camera = find_camera(self, method_call);
+  if (!camera) return;
+
+  FlValue* args = fl_method_call_get_args(method_call);
+  FlValue* mirrored_val = fl_value_lookup_string(args, "mirrored");
+  bool mirrored = mirrored_val ? fl_value_get_bool(mirrored_val) : true;
+
+  camera->SetMirror(mirrored);
+  fl_method_call_respond_success(method_call, fl_value_new_null(), nullptr);
+}
+
 static void handle_dispose(CameraDesktopPlugin* self,
                            FlMethodCall* method_call) {
   FlValue* args = fl_method_call_get_args(method_call);
@@ -242,6 +264,8 @@ static void camera_desktop_plugin_handle_method_call(
     handle_pause_preview(self, method_call);
   } else if (strcmp(method, "resumePreview") == 0) {
     handle_resume_preview(self, method_call);
+  } else if (strcmp(method, "setMirror") == 0) {
+    handle_set_mirror(self, method_call);
   } else if (strcmp(method, "dispose") == 0) {
     handle_dispose(self, method_call);
   } else {
@@ -298,6 +322,12 @@ void camera_desktop_plugin_register_with_registrar(
       "plugins.flutter.io/camera_desktop", FL_METHOD_CODEC(codec));
   fl_method_channel_set_method_call_handler(
       plugin->channel, method_call_cb, g_object_ref(plugin), g_object_unref);
+
+  // Set the global plugin instance for FFI access.
+  {
+    extern void camera_desktop_ffi_set_plugin(void* plugin);
+    camera_desktop_ffi_set_plugin(plugin);
+  }
 
   g_object_unref(plugin);
 }

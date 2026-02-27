@@ -1,10 +1,13 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math';
 
 import 'package:camera_platform_interface/camera_platform_interface.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:stream_transform/stream_transform.dart';
+
+import 'image_stream_ffi.dart';
 
 /// Desktop implementation of [CameraPlatform].
 ///
@@ -80,9 +83,9 @@ class CameraDesktopPlugin extends CameraPlatform {
           final bytes = args['bytes']! as Uint8List;
           controller.add(
             CameraImageData(
-              format: const CameraImageFormat(
+              format: CameraImageFormat(
                 ImageFormatGroup.bgra8888,
-                raw: 'RGBA',
+                raw: Platform.isMacOS ? 'BGRA' : 'RGBA',
               ),
               width: width,
               height: height,
@@ -281,6 +284,30 @@ class CameraDesktopPlugin extends CameraPlatform {
   }
 
   // ---------------------------------------------------------------------------
+  // Mirror control
+  // ---------------------------------------------------------------------------
+
+  /// Toggles horizontal mirroring on the live camera feed.
+  ///
+  /// On macOS, this sets `isVideoMirrored` on the AVCaptureConnection.
+  /// On Linux, this toggles the `videoflip` GStreamer element's method.
+  /// On Windows, this is a no-op (mirror is handled at the Dart/app level).
+  ///
+  /// Can be called while the camera is running — no restart needed.
+  Future<void> setMirror(int cameraId, bool mirrored) async {
+    try {
+      await _channel.invokeMethod<void>('setMirror', {
+        'cameraId': cameraId,
+        'mirrored': mirrored,
+      });
+    } on MissingPluginException {
+      // No native handler on this platform (e.g., Windows) — silently ignore.
+    } on PlatformException catch (e) {
+      throw CameraException(e.code, e.message);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Image streaming
   // ---------------------------------------------------------------------------
 
@@ -292,16 +319,29 @@ class CameraDesktopPlugin extends CameraPlatform {
     int cameraId, {
     CameraImageStreamOptions? options,
   }) {
-    final controller = StreamController<CameraImageData>(
+    final ffi = ImageStreamFfi.tryCreate(cameraId);
+    late final StreamController<CameraImageData> controller;
+
+    controller = StreamController<CameraImageData>(
       onListen: () {
         _channel.invokeMethod<void>('startImageStream', {'cameraId': cameraId});
+        ffi?.start(controller);
       },
       onCancel: () {
+        ffi?.stop();
+        ffi?.dispose();
         _imageStreamControllers.remove(cameraId);
         _channel.invokeMethod<void>('stopImageStream', {'cameraId': cameraId});
       },
     );
-    _imageStreamControllers[cameraId] = controller;
+
+    if (ffi == null) {
+      // Fallback: use MethodChannel path for frame delivery.
+      _imageStreamControllers[cameraId] = controller;
+    }
+    // When FFI is active, don't register in _imageStreamControllers so that
+    // _handleNativeCall("imageStreamFrame") is a no-op for this camera.
+
     return controller.stream;
   }
 

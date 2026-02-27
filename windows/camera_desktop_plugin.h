@@ -18,6 +18,12 @@ class CameraDesktopPlugin : public flutter::Plugin {
 
   ~CameraDesktopPlugin() override;
 
+  // FFI camera lookup (called from image_stream_ffi.cpp).
+  Camera* FindCameraById(int camera_id);
+
+  // Global instance for FFI access.
+  static CameraDesktopPlugin* instance() { return instance_; }
+
  private:
   void HandleMethodCall(
       const flutter::MethodCall<flutter::EncodableValue>& call,
@@ -66,4 +72,6 @@ class CameraDesktopPlugin : public flutter::Plugin {
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> channel_;
   std::map<int, std::unique_ptr<Camera>> cameras_;
   int next_camera_id_ = 1;
+
+  static CameraDesktopPlugin* instance_;
 };

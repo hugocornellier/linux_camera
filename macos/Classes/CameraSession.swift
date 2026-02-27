@@ -1,6 +1,97 @@
 import AVFoundation
 import FlutterMacOS
 
+/// Manages a persistent shared buffer for zero-copy FFI image stream delivery.
+/// Native writes frame data here; Dart reads it directly via FFI pointer.
+class ImageStreamFFI {
+    // Buffer layout matches C struct ImageStreamBuffer:
+    //   int64_t sequence (8 bytes, offset 0)
+    //   int32_t width (4 bytes, offset 8)
+    //   int32_t height (4 bytes, offset 12)
+    //   int32_t bytes_per_row (4 bytes, offset 16)
+    //   int32_t format (4 bytes, offset 20) -- 0=BGRA, 1=RGBA
+    //   int32_t ready (4 bytes, offset 24) -- 1=ready for Dart, 0=being written
+    //   int32_t _pad (4 bytes, offset 28)
+    //   uint8_t pixels[] (offset 32)
+    static let headerSize = 32
+
+    private var buffer: UnsafeMutableRawPointer?
+    private var bufferSize: Int = 0
+    private var callback: (@convention(c) (Int32) -> Void)?
+    private var sequence: Int64 = 0
+    private let lock = NSLock()
+
+    func getBufferPointer() -> UnsafeMutableRawPointer? {
+        lock.lock()
+        defer { lock.unlock() }
+        return buffer
+    }
+
+    var hasCallback: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return callback != nil
+    }
+
+    func registerCallback(_ cb: @convention(c) (Int32) -> Void) {
+        lock.lock()
+        callback = cb
+        lock.unlock()
+    }
+
+    func unregisterCallback() {
+        lock.lock()
+        callback = nil
+        lock.unlock()
+    }
+
+    func writeFrame(pixelBuffer: CVPixelBuffer, cameraId: Int) {
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let dataSize = bytesPerRow * height
+        let totalSize = ImageStreamFFI.headerSize + dataSize
+
+        lock.lock()
+
+        if bufferSize < totalSize {
+            buffer?.deallocate()
+            buffer = UnsafeMutableRawPointer.allocate(byteCount: totalSize, alignment: 8)
+            bufferSize = totalSize
+        }
+
+        guard let buf = buffer else {
+            lock.unlock()
+            return
+        }
+
+        buf.storeBytes(of: Int32(0), toByteOffset: 24, as: Int32.self)
+
+        memcpy(buf.advanced(by: ImageStreamFFI.headerSize), baseAddress, dataSize)
+
+        sequence += 1
+        buf.storeBytes(of: sequence, toByteOffset: 0, as: Int64.self)
+        buf.storeBytes(of: Int32(width), toByteOffset: 8, as: Int32.self)
+        buf.storeBytes(of: Int32(height), toByteOffset: 12, as: Int32.self)
+        buf.storeBytes(of: Int32(bytesPerRow), toByteOffset: 16, as: Int32.self)
+        buf.storeBytes(of: Int32(0), toByteOffset: 20, as: Int32.self)
+        buf.storeBytes(of: Int32(1), toByteOffset: 24, as: Int32.self)
+
+        let cb = callback
+        lock.unlock()
+
+        cb?(Int32(cameraId))
+    }
+
+    deinit {
+        buffer?.deallocate()
+    }
+}
+
 /// Manages a single camera session — AVCaptureSession lifecycle, preview texture,
 /// photo capture, video recording, and image streaming.
 ///
@@ -20,11 +111,25 @@ class CameraSession: NSObject {
 
     private let captureQueue = DispatchQueue(label: "com.hugocornellier.camera_desktop.capture")
     private let audioQueue = DispatchQueue(label: "com.hugocornellier.camera_desktop.audio")
+    private let sessionQueue = DispatchQueue(label: "com.hugocornellier.camera_desktop.session")
+    private let bufferLock = NSLock()
+    private let flagsLock = NSLock()
 
     private var recordHandler = RecordHandler()
-    private var previewPaused = false
-    private var imageStreaming = false
+    private let imageStreamFFI = ImageStreamFFI()
+    private var _previewPaused = false
+    private var _imageStreaming = false
     private var latestBuffer: CVPixelBuffer?
+
+    private var previewPaused: Bool {
+        get { flagsLock.lock(); defer { flagsLock.unlock() }; return _previewPaused }
+        set { flagsLock.lock(); _previewPaused = newValue; flagsLock.unlock() }
+    }
+
+    private var imageStreaming: Bool {
+        get { flagsLock.lock(); defer { flagsLock.unlock() }; return _imageStreaming }
+        set { flagsLock.lock(); _imageStreaming = newValue; flagsLock.unlock() }
+    }
 
     private var actualWidth: Int = 0
     private var actualHeight: Int = 0
@@ -65,14 +170,16 @@ class CameraSession: NSObject {
     /// Initializes the AVCaptureSession. Responds asynchronously when the first frame arrives.
     func initialize(result: @escaping FlutterResult) {
         AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                if !granted {
+            guard let self = self else { return }
+            if !granted {
+                DispatchQueue.main.async {
                     result(FlutterError(code: "permission_denied",
                                         message: "Camera permission was denied",
                                         details: nil))
-                    return
                 }
+                return
+            }
+            self.sessionQueue.async {
                 self.setupSession(result: result)
             }
         }
@@ -91,9 +198,11 @@ class CameraSession: NSObject {
         let devices = AVCaptureDevice.captureDevices(mediaType: .video)
         guard let device = devices.first(where: { $0.uniqueID == config.deviceId })
                 ?? devices.first else {
-            result(FlutterError(code: "no_camera",
-                                message: "No camera device found for ID: \(config.deviceId)",
-                                details: nil))
+            DispatchQueue.main.async {
+                result(FlutterError(code: "no_camera",
+                                    message: "No camera device found for ID: \(self.config.deviceId)",
+                                    details: nil))
+            }
             return
         }
         videoDevice = device
@@ -119,9 +228,12 @@ class CameraSession: NSObject {
                 session.addInput(videoInput)
             }
         } catch {
-            result(FlutterError(code: "input_failed",
-                                message: "Failed to create video input: \(error.localizedDescription)",
-                                details: nil))
+            let message = error.localizedDescription
+            DispatchQueue.main.async {
+                result(FlutterError(code: "input_failed",
+                                    message: "Failed to create video input: \(message)",
+                                    details: nil))
+            }
             return
         }
 
@@ -188,7 +300,11 @@ class CameraSession: NSObject {
     // MARK: - Photo Capture
 
     func takePicture(result: @escaping FlutterResult) {
-        guard let buffer = latestBuffer else {
+        bufferLock.lock()
+        let buffer = latestBuffer
+        bufferLock.unlock()
+
+        guard let buffer = buffer else {
             result(FlutterError(code: "no_frame",
                                 message: "No frame available for capture",
                                 details: nil))
@@ -196,30 +312,42 @@ class CameraSession: NSObject {
         }
 
         let path = PhotoHandler.generatePath(cameraId: cameraId)
-        if PhotoHandler.takePicture(from: buffer, outputPath: path) {
-            result(path)
-        } else {
-            result(FlutterError(code: "capture_failed",
-                                message: "Failed to write JPEG to disk",
-                                details: nil))
+        sessionQueue.async {
+            let success = PhotoHandler.takePicture(from: buffer, outputPath: path)
+            DispatchQueue.main.async {
+                if success {
+                    result(path)
+                } else {
+                    result(FlutterError(code: "capture_failed",
+                                        message: "Failed to write JPEG to disk",
+                                        details: nil))
+                }
+            }
         }
     }
 
     // MARK: - Video Recording
 
     func startVideoRecording(result: @escaping FlutterResult) {
-        do {
-            let path = try recordHandler.startRecording(
-                width: actualWidth,
-                height: actualHeight,
-                enableAudio: config.enableAudio
-            )
-            _ = path // Recording started, path stored internally.
-            result(nil)
-        } catch {
-            result(FlutterError(code: "recording_failed",
-                                message: "Failed to start recording: \(error.localizedDescription)",
-                                details: nil))
+        let enableAudio = config.enableAudio
+
+        sessionQueue.async { [self] in
+            do {
+                let path = try self.recordHandler.startRecording(
+                    width: self.actualWidth,
+                    height: self.actualHeight,
+                    enableAudio: enableAudio
+                )
+                _ = path
+                DispatchQueue.main.async { result(nil) }
+            } catch {
+                let message = error.localizedDescription
+                DispatchQueue.main.async {
+                    result(FlutterError(code: "recording_failed",
+                                        message: "Failed to start recording: \(message)",
+                                        details: nil))
+                }
+            }
         }
     }
 
@@ -254,6 +382,20 @@ class CameraSession: NSObject {
         imageStreaming = false
     }
 
+    // MARK: - FFI Image Stream Access
+
+    func getImageStreamBufferPointer() -> UnsafeMutableRawPointer? {
+        return imageStreamFFI.getBufferPointer()
+    }
+
+    func registerImageStreamCallback(_ callback: @convention(c) (Int32) -> Void) {
+        imageStreamFFI.registerCallback(callback)
+    }
+
+    func unregisterImageStreamCallback() {
+        imageStreamFFI.unregisterCallback()
+    }
+
     // MARK: - Preview Control
 
     func pausePreview() {
@@ -264,26 +406,40 @@ class CameraSession: NSObject {
         previewPaused = false
     }
 
+    // MARK: - Mirror Control
+
+    /// Toggles horizontal mirroring on the live video output connection.
+    /// Can be called while the session is running — no restart needed.
+    func setMirror(mirrored: Bool) {
+        sessionQueue.async { [self] in
+            guard let connection = self.videoOutput?.connection(with: .video),
+                  connection.isVideoMirroringSupported else {
+                return
+            }
+            connection.automaticallyAdjustsVideoMirroring = false
+            connection.isVideoMirrored = mirrored
+        }
+    }
+
     // MARK: - Disposal
 
     func dispose() {
-        if recordHandler.isRecording {
-            recordHandler.stopRecording { _ in }
+        sessionQueue.async { [self] in
+            self.recordHandler.stopRecording { _ in }
+            self.captureSession?.stopRunning()
+            self.captureSession = nil
+            self.videoDevice = nil
+            self.videoOutput = nil
+            self.audioOutput = nil
+
+            DispatchQueue.main.async {
+                if self.texture != nil, let registry = self.textureRegistry {
+                    registry.unregisterTexture(self.textureId)
+                }
+                self.texture = nil
+                self.methodChannel?.invokeMethod("cameraClosing", arguments: ["cameraId": self.cameraId])
+            }
         }
-
-        captureSession?.stopRunning()
-        captureSession = nil
-        videoDevice = nil
-        videoOutput = nil
-        audioOutput = nil
-
-        if texture != nil, let registry = textureRegistry {
-            registry.unregisterTexture(textureId)
-        }
-        texture = nil
-
-        // Send closing event to Dart.
-        methodChannel?.invokeMethod("cameraClosing", arguments: ["cameraId": cameraId])
     }
 }
 
@@ -309,7 +465,9 @@ extension CameraSession: AVCaptureVideoDataOutputSampleBufferDelegate,
         let height = CVPixelBufferGetHeight(pixelBuffer)
 
         // Store the latest buffer for photo capture.
+        bufferLock.lock()
         latestBuffer = pixelBuffer
+        bufferLock.unlock()
 
         // Handle first-frame initialization response.
         let isFirstFrame = !firstFrameReceived
@@ -342,22 +500,24 @@ extension CameraSession: AVCaptureVideoDataOutputSampleBufferDelegate,
 
         // Send frame to Dart image stream if active.
         if imageStreaming {
-            CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-            defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
-
-            guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
-            let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
-            let dataSize = bytesPerRow * height
-            let data = Data(bytes: baseAddress, count: dataSize)
-
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-                self.methodChannel?.invokeMethod("imageStreamFrame", arguments: [
-                    "cameraId": self.cameraId,
-                    "width": width,
-                    "height": height,
-                    "bytes": FlutterStandardTypedData(bytes: data),
-                ])
+            if imageStreamFFI.hasCallback {
+                imageStreamFFI.writeFrame(pixelBuffer: pixelBuffer, cameraId: cameraId)
+            } else {
+                CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+                defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+                guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
+                let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+                let dataSize = bytesPerRow * height
+                let data = Data(bytes: baseAddress, count: dataSize)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    self.methodChannel?.invokeMethod("imageStreamFrame", arguments: [
+                        "cameraId": self.cameraId,
+                        "width": width,
+                        "height": height,
+                        "bytes": FlutterStandardTypedData(bytes: data),
+                    ])
+                }
             }
         }
     }

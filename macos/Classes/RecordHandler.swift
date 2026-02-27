@@ -7,6 +7,7 @@ class RecordHandler: NSObject {
     private var audioInput: AVAssetWriterInput?
     private var outputPath: String?
     private var sessionStarted = false
+    private let lock = NSLock()
 
     private(set) var isRecording = false
 
@@ -18,10 +19,13 @@ class RecordHandler: NSObject {
     /// - Returns: The output file path on success.
     /// - Throws: If the asset writer cannot be created.
     func startRecording(width: Int, height: Int, enableAudio: Bool) throws -> String {
-        guard !isRecording else {
+        lock.lock()
+        if isRecording {
+            lock.unlock()
             throw NSError(domain: "camera_desktop", code: -1,
                           userInfo: [NSLocalizedDescriptionKey: "Already recording"])
         }
+        lock.unlock()
 
         let path = RecordHandler.generatePath()
         let url = URL(fileURLWithPath: path)
@@ -42,9 +46,9 @@ class RecordHandler: NSObject {
         if writer.canAdd(vInput) {
             writer.add(vInput)
         }
-        videoInput = vInput
 
         // Audio input — AAC encoding.
+        var aInput: AVAssetWriterInput?
         if enableAudio {
             let audioSettings: [String: Any] = [
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
@@ -52,32 +56,38 @@ class RecordHandler: NSObject {
                 AVNumberOfChannelsKey: 2,
                 AVEncoderBitRateKey: 128000,
             ]
-            let aInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-            aInput.expectsMediaDataInRealTime = true
-            if writer.canAdd(aInput) {
-                writer.add(aInput)
+            aInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+            aInput!.expectsMediaDataInRealTime = true
+            if writer.canAdd(aInput!) {
+                writer.add(aInput!)
             }
-            audioInput = aInput
-        } else {
-            audioInput = nil
         }
 
         writer.startWriting()
+
+        lock.lock()
         assetWriter = writer
+        videoInput = vInput
+        audioInput = aInput
         outputPath = path
         sessionStarted = false
         isRecording = true
+        lock.unlock()
 
         return path
     }
 
     /// Appends a video sample buffer to the recording.
     func appendVideoBuffer(_ sampleBuffer: CMSampleBuffer) {
+        lock.lock()
         guard isRecording,
               let writer = assetWriter,
               writer.status == .writing,
               let input = videoInput,
-              input.isReadyForMoreMediaData else { return }
+              input.isReadyForMoreMediaData else {
+            lock.unlock()
+            return
+        }
 
         if !sessionStarted {
             let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
@@ -86,33 +96,51 @@ class RecordHandler: NSObject {
         }
 
         input.append(sampleBuffer)
+        lock.unlock()
     }
 
     /// Appends an audio sample buffer to the recording.
     func appendAudioBuffer(_ sampleBuffer: CMSampleBuffer) {
+        lock.lock()
         guard isRecording,
               let writer = assetWriter,
               writer.status == .writing,
               let input = audioInput,
               input.isReadyForMoreMediaData,
-              sessionStarted else { return }
+              sessionStarted else {
+            lock.unlock()
+            return
+        }
 
         input.append(sampleBuffer)
+        lock.unlock()
     }
 
     /// Stops recording and finalizes the file.
     /// - Parameter completion: Called with the output file path on success, or nil on failure.
     func stopRecording(completion: @escaping (String?) -> Void) {
+        lock.lock()
         guard isRecording, let writer = assetWriter else {
+            lock.unlock()
             completion(nil)
             return
         }
 
         isRecording = false
-        videoInput?.markAsFinished()
-        audioInput?.markAsFinished()
-
+        let vInput = videoInput
+        let aInput = audioInput
         let path = outputPath
+
+        assetWriter = nil
+        videoInput = nil
+        audioInput = nil
+        outputPath = nil
+        sessionStarted = false
+        lock.unlock()
+
+        vInput?.markAsFinished()
+        aInput?.markAsFinished()
+
         writer.finishWriting {
             if writer.status == .completed {
                 completion(path)
@@ -120,12 +148,6 @@ class RecordHandler: NSObject {
                 completion(nil)
             }
         }
-
-        assetWriter = nil
-        videoInput = nil
-        audioInput = nil
-        outputPath = nil
-        sessionStarted = false
     }
 
     /// Generates a unique temporary file path for a video recording.

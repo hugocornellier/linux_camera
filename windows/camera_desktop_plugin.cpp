@@ -13,6 +13,8 @@
 
 #include "device_enumerator.h"
 
+CameraDesktopPlugin* CameraDesktopPlugin::instance_ = nullptr;
+
 // ---------------------------------------------------------------------------
 // C export — called by generated_plugin_registrant.cc
 // ---------------------------------------------------------------------------
@@ -41,6 +43,8 @@ void CameraDesktopPlugin::RegisterWithRegistrar(
 
   auto plugin = std::make_unique<CameraDesktopPlugin>(registrar,
                                                        std::move(channel));
+  instance_ = plugin.get();
+
   plugin->channel_->SetMethodCallHandler(
       [plugin_ptr = plugin.get()](const auto& call, auto result) {
         plugin_ptr->HandleMethodCall(call, std::move(result));
@@ -55,6 +59,7 @@ CameraDesktopPlugin::CameraDesktopPlugin(
     : registrar_(registrar), channel_(std::move(channel)) {}
 
 CameraDesktopPlugin::~CameraDesktopPlugin() {
+  instance_ = nullptr;
   for (auto& [id, camera] : cameras_) {
     camera->Dispose();
   }
@@ -131,7 +136,7 @@ void CameraDesktopPlugin::HandleAvailableCameras(
         {flutter::EncodableValue("name"),
          flutter::EncodableValue(display_name)},
         {flutter::EncodableValue("lensDirection"),
-         flutter::EncodableValue(0)},  // front-facing (same as camera_windows)
+         flutter::EncodableValue(0)},  // front-facing
         {flutter::EncodableValue("sensorOrientation"),
          flutter::EncodableValue(0)},
     }));
@@ -214,6 +219,12 @@ Camera* CameraDesktopPlugin::FindCamera(
     return nullptr;
   }
   return cam_it->second.get();
+}
+
+Camera* CameraDesktopPlugin::FindCameraById(int camera_id) {
+  auto it = cameras_.find(camera_id);
+  if (it == cameras_.end()) return nullptr;
+  return it->second.get();
 }
 
 void CameraDesktopPlugin::HandleInitialize(

@@ -11,7 +11,7 @@ class DeviceEnumerator {
     /// Enumerates available video capture devices.
     static func enumerateDevices() -> [DeviceInfo] {
         let devices = AVCaptureDevice.captureDevices(mediaType: .video)
-        return devices.map { device in
+        let infos = devices.map { device -> (AVCaptureDevice, DeviceInfo) in
             let lensDirection: Int
             switch device.position {
             case .front:
@@ -21,16 +21,54 @@ class DeviceEnumerator {
             default:
                 lensDirection = 2
             }
-            // Use deviceId in parentheses so the Dart side can extract it,
-            // matching the Linux convention: "Friendly Name (deviceId)"
             let displayName = "\(device.localizedName) (\(device.uniqueID))"
-            return DeviceInfo(
+            let info = DeviceInfo(
                 deviceId: device.uniqueID,
                 name: displayName,
                 lensDirection: lensDirection,
                 sensorOrientation: 0
             )
+            return (device, info)
         }
+
+        // Sort: built-in cameras first, Continuity Camera last.
+        let sorted = infos.sorted { a, b in
+            let aScore = DeviceEnumerator.sortScore(for: a.0)
+            let bScore = DeviceEnumerator.sortScore(for: b.0)
+            return aScore < bScore
+        }
+
+        return sorted.map { $0.1 }
+    }
+
+    /// Returns a sort score for camera ordering.
+    /// Lower = higher priority (appears first in the list).
+    ///   0 = built-in camera (preferred)
+    ///   1 = other/external camera
+    ///   2 = Continuity Camera (least preferred — often causes grey frames)
+    private static func sortScore(for device: AVCaptureDevice) -> Int {
+        // macOS 14+: AVCaptureDevice.DeviceType.continuityCamera is available
+        if #available(macOS 14.0, *) {
+            if device.deviceType == .continuityCamera {
+                return 2
+            }
+        }
+
+        // Fallback heuristic for pre-macOS 14 or unrecognized Continuity devices
+        let modelId = device.modelID.lowercased()
+        let name = device.localizedName.lowercased()
+        if modelId.contains("iphone") || modelId.contains("ipad") ||
+           name.contains("iphone") || name.contains("continuity") {
+            return 2
+        }
+
+        // Built-in cameras have position .front or .back
+        if device.position == .front || device.position == .back {
+            return 0
+        }
+
+        // External cameras
+        return 1
     }
 
     /// Extracts the device ID from a camera name in the format "Friendly Name (deviceId)".

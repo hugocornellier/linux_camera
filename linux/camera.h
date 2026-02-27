@@ -69,6 +69,14 @@ class Camera {
   void StartImageStream();
   void StopImageStream();
 
+  // FFI image stream access.
+  void* GetImageStreamBuffer() const { return image_stream_buffer_; }
+  void RegisterImageStreamCallback(void (*callback)(int32_t));
+  void UnregisterImageStreamCallback();
+
+  // Toggles horizontal mirroring on the live video feed.
+  void SetMirror(bool mirrored);
+
   // Tears down the pipeline and releases all resources.
   void Dispose();
 
@@ -97,6 +105,7 @@ class Camera {
   GstElement* pipeline_;
   GstElement* tee_;       // For branching preview + recording.
   GstElement* appsink_;
+  GstElement* videoflip_;  // Named element in pipeline for mirror toggle.
   guint bus_watch_id_;
   guint init_timeout_id_;
 
@@ -107,6 +116,23 @@ class Camera {
   bool first_frame_received_;
   bool preview_paused_;
   std::atomic<bool> image_streaming_;
+
+  // FFI image stream shared buffer.
+  struct ImageStreamBuffer {
+    int64_t  sequence;
+    int32_t  width;
+    int32_t  height;
+    int32_t  bytes_per_row;
+    int32_t  format;       // 0=BGRA, 1=RGBA
+    int32_t  ready;        // 1=Dart may read, 0=native writing
+    int32_t  _pad;
+    uint8_t  pixels[];     // flexible array member
+  };
+
+  ImageStreamBuffer* image_stream_buffer_ = nullptr;
+  size_t image_stream_buffer_size_ = 0;
+  void (*image_stream_callback_)(int32_t) = nullptr;
+  int64_t image_stream_sequence_ = 0;
 
   int actual_width_;
   int actual_height_;

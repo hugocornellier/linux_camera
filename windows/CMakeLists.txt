@@ -11,6 +11,7 @@ add_library(${PLUGIN_NAME} SHARED
   camera.cpp
   camera_texture.cpp
   device_enumerator.cpp
+  image_stream_ffi.cpp
   photo_handler.cpp
   record_handler.cpp
 )

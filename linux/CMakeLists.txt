@@ -12,6 +12,7 @@ list(APPEND PLUGIN_SOURCES
   "device_enumerator.cc"
   "photo_handler.cc"
   "record_handler.cc"
+  "image_stream_ffi.cc"
 )
 
 add_library(${PLUGIN_NAME} SHARED

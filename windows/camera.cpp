@@ -614,16 +614,64 @@ void Camera::StopImageStream() {
   image_stream_thread_ = std::thread{};
 }
 
+void* Camera::GetImageStreamBuffer() {
+  std::lock_guard<std::mutex> lk(image_stream_ffi_mutex_);
+  return image_stream_buffer_;
+}
+
+void Camera::RegisterImageStreamCallback(void (*callback)(int32_t)) {
+  std::lock_guard<std::mutex> lk(image_stream_ffi_mutex_);
+  image_stream_callback_ = callback;
+}
+
+void Camera::UnregisterImageStreamCallback() {
+  std::lock_guard<std::mutex> lk(image_stream_ffi_mutex_);
+  image_stream_callback_ = nullptr;
+}
+
 void Camera::PostImageStreamFrame(const uint8_t* data, int width, int height) {
-  const size_t len = static_cast<size_t>(width) * height * 4;
+  const size_t frame_size = static_cast<size_t>(width) * height * 4;
+  void (*cb)(int32_t) = nullptr;
+
   {
+    std::lock_guard<std::mutex> lk(image_stream_ffi_mutex_);
+    if (image_stream_callback_) {
+      // FFI path: write to shared buffer.
+      const size_t total_size = offsetof(ImageStreamBuffer, pixels) + frame_size;
+
+      if (image_stream_buffer_size_ < total_size) {
+        free(image_stream_buffer_);
+        image_stream_buffer_ =
+            static_cast<ImageStreamBuffer*>(malloc(total_size));
+        image_stream_buffer_size_ = total_size;
+      }
+
+      auto* buf = image_stream_buffer_;
+      buf->ready = 0;
+      std::memcpy(buf->pixels, data, frame_size);
+      buf->width = width;
+      buf->height = height;
+      buf->bytes_per_row = width * 4;
+      buf->format = 1;  // RGBA (post-SwapRBChannels)
+      buf->sequence = ++image_stream_sequence_;
+      buf->ready = 1;
+
+      cb = image_stream_callback_;
+    }
+  }
+
+  if (cb) {
+    // Notify Dart outside the lock.
+    cb(camera_id_);
+  } else {
+    // Legacy MethodChannel fallback: post to delivery thread.
     std::lock_guard<std::mutex> lk(image_stream_mutex_);
-    image_stream_slot_.data.assign(data, data + len);
+    image_stream_slot_.data.assign(data, data + frame_size);
     image_stream_slot_.width  = width;
     image_stream_slot_.height = height;
     image_stream_slot_.dirty  = true;
+    image_stream_cv_.notify_one();
   }
-  image_stream_cv_.notify_one();
 }
 
 void Camera::ImageStreamLoop() {
@@ -728,6 +776,17 @@ void Camera::Dispose() {
   // 3. Stop image stream if active (P6).
   if (image_stream_thread_.joinable()) {
     StopImageStream();
+  }
+
+  // Clean up FFI image stream buffer.
+  {
+    std::lock_guard<std::mutex> lk(image_stream_ffi_mutex_);
+    image_stream_callback_ = nullptr;
+    if (image_stream_buffer_) {
+      free(image_stream_buffer_);
+      image_stream_buffer_ = nullptr;
+      image_stream_buffer_size_ = 0;
+    }
   }
 
   // 4. Stop capture: flush reader to unblock blocking ReadSample (P5).

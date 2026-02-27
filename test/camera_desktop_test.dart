@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:camera_desktop/camera_desktop.dart';
+import 'package:camera_desktop/src/image_stream_ffi.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -248,6 +249,37 @@ void main() {
       expect(await plugin.getMinExposureOffset(1), 0.0);
       expect(await plugin.getMaxExposureOffset(1), 0.0);
       expect(await plugin.getExposureOffsetStepSize(1), 0.0);
+    });
+
+    test('ImageStreamFfi.tryCreate returns null in test environment', () {
+      // In the test environment, no native library is loaded, so FFI
+      // symbol lookup should fail and tryCreate should return null.
+      final ffi = ImageStreamFfi.tryCreate(1);
+      expect(ffi, isNull);
+    });
+
+    test('onStreamedFrameAvailable uses MethodChannel fallback when FFI '
+        'unavailable', () async {
+      const description = CameraDescription(
+        name: 'Test Camera (/dev/video0)',
+        lensDirection: CameraLensDirection.external,
+        sensorOrientation: 0,
+      );
+      final cameraId = await plugin.createCameraWithSettings(
+        description,
+        const MediaSettings(resolutionPreset: ResolutionPreset.high),
+      );
+
+      // Start the image stream — should use MethodChannel fallback since
+      // FFI symbols are not available in the test environment.
+      final stream = plugin.onStreamedFrameAvailable(cameraId);
+      final subscription = stream.listen((_) {});
+      await Future<void>.delayed(Duration.zero);
+      expect(log.last.method, 'startImageStream');
+
+      await subscription.cancel();
+      await Future<void>.delayed(Duration.zero);
+      expect(log.last.method, 'stopImageStream');
     });
   });
 }

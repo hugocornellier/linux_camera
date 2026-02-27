@@ -11,7 +11,7 @@ so it works seamlessly with the standard
 |----------|---------|--------|
 | **Linux** | GStreamer + V4L2 | Included |
 | **macOS** | AVFoundation | Included |
-| **Windows** | Media Foundation | Via [`camera_windows`](https://pub.dev/packages/camera_windows) (transitive) |
+| **Windows** | Media Foundation | Included |
 
 ## Installation
 
@@ -86,8 +86,7 @@ For sandboxed apps, add to your entitlements:
 
 ### Windows
 
-No additional setup required. Camera support is provided automatically via
-`camera_windows`.
+No additional setup required.
 
 ## Features
 
