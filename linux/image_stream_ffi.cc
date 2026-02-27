@@ -11,8 +11,8 @@ typedef struct _CameraDesktopPlugin CameraDesktopPlugin;
 static CameraDesktopPlugin* g_plugin_instance = nullptr;
 
 // Camera lookup function — implemented in camera_desktop_plugin.cc.
-extern Camera* camera_desktop_find_camera_by_id(CameraDesktopPlugin* plugin,
-                                                 int camera_id);
+extern "C" Camera* camera_desktop_find_camera_by_id(CameraDesktopPlugin* plugin,
+                                                     int camera_id);
 
 extern "C" {
 
