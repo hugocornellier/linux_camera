@@ -1,8 +1,10 @@
 #include "camera.h"
 #include "photo_handler.h"
 
+#include <gio/gio.h>
 #include <gst/video/video.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 
@@ -30,6 +32,7 @@ Camera::Camera(int camera_id,
       first_frame_received_(false),
       preview_paused_(false),
       image_streaming_(false),
+      image_stream_callback_(nullptr),
       actual_width_(0),
       actual_height_(0) {}
 
@@ -50,7 +53,7 @@ int64_t Camera::RegisterTexture() {
 }
 
 void Camera::Initialize(FlMethodCall* method_call) {
-  if (state_ != CameraState::kCreated) {
+  if (state_.load() != CameraState::kCreated) {
     g_autoptr(FlValue) error_details = fl_value_new_null();
     fl_method_call_respond_error(method_call, "already_initialized",
                                  "Camera is already initialized or disposed",
@@ -58,15 +61,15 @@ void Camera::Initialize(FlMethodCall* method_call) {
     return;
   }
 
-  state_ = CameraState::kInitializing;
+  state_.store(CameraState::kInitializing);
   pending_init_call_ = FL_METHOD_CALL(g_object_ref(method_call));
-  first_frame_received_ = false;
+  first_frame_received_.store(false);
 
   GError* error = nullptr;
   if (!BuildPipeline(&error)) {
     RespondToPendingInit(false, error->message);
     g_error_free(error);
-    state_ = CameraState::kCreated;
+    state_.store(CameraState::kCreated);
     return;
   }
 
@@ -78,7 +81,7 @@ void Camera::Initialize(FlMethodCall* method_call) {
     gst_object_unref(pipeline_);
     pipeline_ = nullptr;
     appsink_ = nullptr;
-    state_ = CameraState::kCreated;
+    state_.store(CameraState::kCreated);
     return;
   }
 
@@ -168,9 +171,9 @@ void Camera::RespondToPendingInit(bool success, const char* error_message) {
   if (success) {
     g_autoptr(FlValue) result = fl_value_new_map();
     fl_value_set_string_take(result, "previewWidth",
-                             fl_value_new_float((double)actual_width_));
+                             fl_value_new_float((double)actual_width_.load()));
     fl_value_set_string_take(result, "previewHeight",
-                             fl_value_new_float((double)actual_height_));
+                             fl_value_new_float((double)actual_height_.load()));
     fl_method_call_respond_success(pending_init_call_, result, nullptr);
   } else {
     g_autoptr(FlValue) details = fl_value_new_null();
@@ -209,22 +212,27 @@ GstFlowReturn Camera::OnNewSample(GstAppSink* sink, gpointer user_data) {
   }
 
   // Handle first-frame initialization response.
-  bool is_first_frame = !self->first_frame_received_;
+  // C-2: first_frame_received_ is atomic — safe cross-thread read/write.
+  bool is_first_frame = !self->first_frame_received_.load();
   if (is_first_frame) {
-    self->first_frame_received_ = true;
-    self->actual_width_ = width;
-    self->actual_height_ = height;
-    self->state_ = CameraState::kRunning;
+    self->first_frame_received_.store(true);
+    // H-2: actual_width_/height_ are atomic — safe cross-thread write.
+    self->actual_width_.store(width);
+    self->actual_height_.store(height);
+    self->state_.store(CameraState::kRunning);
   }
 
   // Update the texture only if preview is not paused (or if this is the first
   // frame, which we need for initialization).
-  if (!self->preview_paused_ || is_first_frame) {
+  // C-3: preview_paused_ is atomic — safe cross-thread read.
+  if (!self->preview_paused_.load() || is_first_frame) {
     if (stride == width * 4) {
       // No padding — direct copy.
       camera_texture_update(self->texture_, map.data, width, height);
     } else {
-      // Stride has padding — copy row-by-row, stripping padding.
+      // Stride has padding — copy row-by-row into a tight buffer.
+      // M-1 note: this intermediate allocation is unavoidable here since
+      // camera_texture_update requires a tightly-packed buffer.
       size_t tight_size = (size_t)width * height * 4;
       uint8_t* tight = (uint8_t*)g_malloc(tight_size);
       for (int row = 0; row < height; row++) {
@@ -241,8 +249,12 @@ GstFlowReturn Camera::OnNewSample(GstAppSink* sink, gpointer user_data) {
   }
 
   // Send frame to Dart image stream if streaming is active.
-  if (self->image_streaming_) {
-    if (self->image_stream_callback_) {
+  if (self->image_streaming_.load()) {
+    // C-4: load the callback pointer atomically once, then use the local copy.
+    // This prevents a TOCTOU race where the pointer is nulled between the
+    // check and the call.
+    ImageStreamCallback cb = self->image_stream_callback_.load();
+    if (cb) {
       // FFI path: write to shared buffer, notify Dart directly.
       size_t frame_size = (size_t)width * height * 4;
       size_t total_size = offsetof(Camera::ImageStreamBuffer, pixels) + frame_size;
@@ -271,9 +283,13 @@ GstFlowReturn Camera::OnNewSample(GstAppSink* sink, gpointer user_data) {
       buf->bytes_per_row = width * 4;
       buf->format = 1;  // RGBA (Linux GStreamer pipeline)
       buf->sequence = ++self->image_stream_sequence_;
+
+      // C-5: release fence — guarantees all pixel and metadata writes above
+      // are visible to any thread that subsequently observes ready == 1.
+      std::atomic_thread_fence(std::memory_order_release);
       buf->ready = 1;
 
-      self->image_stream_callback_(self->camera_id_);
+      cb(self->camera_id_);
     } else {
       // Legacy MethodChannel fallback path.
       size_t frame_size = (size_t)width * height * 4;
@@ -359,13 +375,12 @@ gboolean Camera::OnBusMessage(GstBus* bus, GstMessage* msg,
       gchar* debug = nullptr;
       gst_message_parse_error(msg, &err, &debug);
 
-      if (self->state_ == CameraState::kInitializing) {
-        // Initialization failed — respond to pending call.
+      // C-2: load state_ atomically.
+      CameraState s = self->state_.load();
+      if (s == CameraState::kInitializing) {
         self->RespondToPendingInit(false, err->message);
-        self->state_ = CameraState::kCreated;
-      } else if (self->state_ == CameraState::kRunning ||
-                 self->state_ == CameraState::kPaused) {
-        // Runtime error — send event to Dart.
+        self->state_.store(CameraState::kCreated);
+      } else if (s == CameraState::kRunning || s == CameraState::kPaused) {
         self->SendError(err->message);
       }
 
@@ -375,8 +390,8 @@ gboolean Camera::OnBusMessage(GstBus* bus, GstMessage* msg,
     }
     case GST_MESSAGE_EOS: {
       // End of stream (e.g., device unplugged).
-      if (self->state_ == CameraState::kRunning ||
-          self->state_ == CameraState::kPaused) {
+      CameraState s = self->state_.load();
+      if (s == CameraState::kRunning || s == CameraState::kPaused) {
         self->SendError("Camera stream ended unexpectedly");
       }
       break;
@@ -391,14 +406,13 @@ gboolean Camera::OnInitTimeout(gpointer user_data) {
   Camera* self = static_cast<Camera*>(user_data);
   self->init_timeout_id_ = 0;
 
-  if (self->state_ == CameraState::kInitializing) {
+  if (self->state_.load() == CameraState::kInitializing) {
     self->RespondToPendingInit(
         false, "Camera initialization timed out — no frames received");
-    // Stop the pipeline.
     if (self->pipeline_) {
       gst_element_set_state(self->pipeline_, GST_STATE_NULL);
     }
-    self->state_ = CameraState::kCreated;
+    self->state_.store(CameraState::kCreated);
   }
   return G_SOURCE_REMOVE;
 }
@@ -414,35 +428,86 @@ void Camera::SendError(const std::string& description) {
 }
 
 void Camera::TakePicture(FlMethodCall* method_call) {
-  if (state_ != CameraState::kRunning && state_ != CameraState::kPaused) {
+  CameraState s = state_.load();
+  if (s != CameraState::kRunning && s != CameraState::kPaused) {
     g_autoptr(FlValue) details = fl_value_new_null();
     fl_method_call_respond_error(method_call, "not_running",
                                  "Camera is not running", details, nullptr);
     return;
   }
 
-  // Generate a unique temporary file path.
+  // Generate a unique temporary file path using an atomic sequence counter
+  // rather than the wall clock to prevent collisions under NTP corrections.
+  static std::atomic<int64_t> capture_seq{0};
   gchar* tmp_path =
-      g_strdup_printf("%s/camera_desktop_%d_%ld.jpg", g_get_tmp_dir(),
-                      camera_id_, g_get_real_time());
+      g_strdup_printf("%s/camera_desktop_%d_%" G_GINT64_FORMAT ".jpg",
+                      g_get_tmp_dir(), camera_id_,
+                      capture_seq.fetch_add(1, std::memory_order_relaxed));
 
-  GError* error = nullptr;
-  if (PhotoHandler::TakePicture(appsink_, tmp_path, &error)) {
-    g_autoptr(FlValue) result = fl_value_new_string(tmp_path);
-    fl_method_call_respond_success(method_call, result, nullptr);
-  } else {
-    g_autoptr(FlValue) details = fl_value_new_null();
-    fl_method_call_respond_error(
-        method_call, "capture_failed",
-        error ? error->message : "Failed to capture image", details, nullptr);
-    if (error) g_error_free(error);
-  }
+  // C-7: gst_video_convert_sample performs synchronous JPEG encoding which
+  // can take 30–200 ms at 1080p. Offload to a GLib thread-pool task so the
+  // main/UI thread is never blocked.
+  //
+  // Take a GStreamer reference to appsink_ so it stays alive for the duration
+  // of the task even if Dispose() is called concurrently.
+  struct TakePictureData {
+    GstElement* appsink;   // holds a gst_object_ref
+    std::string output_path;
+    std::string error_message;
+    bool success;
+    FlMethodCall* method_call;  // holds a g_object_ref
+  };
 
+  auto* d = new TakePictureData();
+  d->appsink = GST_ELEMENT(gst_object_ref(appsink_));
+  d->output_path = tmp_path;
+  d->success = false;
+  d->method_call = FL_METHOD_CALL(g_object_ref(method_call));
   g_free(tmp_path);
+
+  GTask* task = g_task_new(nullptr, nullptr, nullptr, nullptr);
+  g_task_set_task_data(task, d, nullptr);
+  g_task_run_in_thread(
+      task,
+      [](GTask* /*task*/, gpointer /*source*/, gpointer task_data,
+         GCancellable* /*cancel*/) {
+        auto* d = static_cast<TakePictureData*>(task_data);
+        GError* err = nullptr;
+        d->success = PhotoHandler::TakePicture(d->appsink, d->output_path, &err);
+        gst_object_unref(d->appsink);
+        d->appsink = nullptr;
+        if (!d->success && err) {
+          d->error_message = err->message;
+          g_error_free(err);
+        }
+        // Marshal the method-channel response back to the main GLib thread.
+        g_idle_add(
+            [](gpointer p) -> gboolean {
+              auto* d = static_cast<TakePictureData*>(p);
+              if (d->success) {
+                g_autoptr(FlValue) result =
+                    fl_value_new_string(d->output_path.c_str());
+                fl_method_call_respond_success(d->method_call, result, nullptr);
+              } else {
+                g_autoptr(FlValue) details = fl_value_new_null();
+                fl_method_call_respond_error(
+                    d->method_call, "capture_failed",
+                    d->error_message.empty() ? "Failed to capture image"
+                                             : d->error_message.c_str(),
+                    details, nullptr);
+              }
+              g_object_unref(d->method_call);
+              delete d;
+              return G_SOURCE_REMOVE;
+            },
+            d);
+      });
+  g_object_unref(task);
 }
 
 void Camera::StartVideoRecording(FlMethodCall* method_call) {
-  if (state_ != CameraState::kRunning && state_ != CameraState::kPaused) {
+  CameraState s = state_.load();
+  if (s != CameraState::kRunning && s != CameraState::kPaused) {
     g_autoptr(FlValue) details = fl_value_new_null();
     fl_method_call_respond_error(method_call, "not_running",
                                  "Camera is not running", details, nullptr);
@@ -452,8 +517,11 @@ void Camera::StartVideoRecording(FlMethodCall* method_call) {
   // Set up the recording branch on first use.
   if (!record_handler_->is_recording()) {
     GError* error = nullptr;
-    if (!record_handler_->Setup(pipeline_, tee_, actual_width_,
-                                actual_height_, config_.target_fps,
+    // H-2: load actual dimensions atomically — they are written from the
+    // GStreamer streaming thread on first frame.
+    if (!record_handler_->Setup(pipeline_, tee_,
+                                actual_width_.load(), actual_height_.load(),
+                                config_.target_fps,
                                 config_.enable_audio, &error)) {
       g_autoptr(FlValue) details = fl_value_new_null();
       fl_method_call_respond_error(
@@ -465,10 +533,14 @@ void Camera::StartVideoRecording(FlMethodCall* method_call) {
     }
   }
 
-  // Generate output path.
-  gchar* tmp_path =
-      g_strdup_printf("%s/camera_desktop_%d_%ld.mp4", g_get_tmp_dir(),
-                      camera_id_, g_get_real_time());
+  // H-6: derive extension from the muxer that was actually selected so the
+  // file's extension always matches its container format.
+  static std::atomic<int64_t> rec_seq{0};
+  gchar* tmp_path = g_strdup_printf(
+      "%s/camera_desktop_%d_%" G_GINT64_FORMAT ".%s",
+      g_get_tmp_dir(), camera_id_,
+      rec_seq.fetch_add(1, std::memory_order_relaxed),
+      record_handler_->output_extension());
 
   GError* error = nullptr;
   if (!record_handler_->StartRecording(tmp_path, &error)) {
@@ -494,7 +566,6 @@ void Camera::StopVideoRecording(FlMethodCall* method_call) {
     return;
   }
 
-  // StopRecording responds asynchronously when the file is finalized.
   record_handler_->StopRecording(method_call);
 }
 
@@ -507,19 +578,23 @@ void Camera::StopImageStream() {
 }
 
 void Camera::RegisterImageStreamCallback(void (*callback)(int32_t)) {
-  image_stream_callback_ = callback;
+  // C-4: atomic store — safe to write from main thread while GStreamer thread
+  // reads. The GStreamer thread loads the pointer once per frame (see
+  // OnNewSample) so it cannot race between check and call.
+  image_stream_callback_.store(callback);
 }
 
 void Camera::UnregisterImageStreamCallback() {
-  image_stream_callback_ = nullptr;
+  image_stream_callback_.store(nullptr);
 }
 
 void Camera::PausePreview() {
-  preview_paused_ = true;
+  // C-3: atomic store — safe cross-thread write.
+  preview_paused_.store(true);
 }
 
 void Camera::ResumePreview() {
-  preview_paused_ = false;
+  preview_paused_.store(false);
 }
 
 void Camera::SetMirror(bool mirrored) {
@@ -529,25 +604,27 @@ void Camera::SetMirror(bool mirrored) {
 }
 
 void Camera::Dispose() {
-  if (state_ == CameraState::kDisposed || state_ == CameraState::kDisposing) {
+  // C-2: use atomic exchange so the check-and-set is race-free. If two threads
+  // somehow call Dispose() concurrently, only one proceeds.
+  CameraState prev = state_.exchange(CameraState::kDisposing);
+  if (prev == CameraState::kDisposed || prev == CameraState::kDisposing) {
     return;
   }
-  state_ = CameraState::kDisposing;
 
-  // Cancel pending init if still waiting.
+  // Cancel pending init if still waiting (main thread → main thread, safe).
   if (pending_init_call_) {
     RespondToPendingInit(false, "Camera disposed during initialization");
   }
 
-  // Clean up FFI image stream buffer.
-  image_stream_callback_ = nullptr;
-  if (image_stream_buffer_) {
-    g_free(image_stream_buffer_);
-    image_stream_buffer_ = nullptr;
-    image_stream_buffer_size_ = 0;
-  }
+  // C-4: null the callback atomically BEFORE stopping the pipeline. This
+  // prevents new FFI callbacks from being registered while we're tearing down,
+  // but does NOT free the buffer yet — that must wait until the pipeline stops.
+  image_stream_callback_.store(nullptr);
 
-  // Stop the pipeline.
+  // C-1 FIX: stop the pipeline BEFORE freeing image_stream_buffer_.
+  // gst_element_set_state(NULL) blocks until the GStreamer streaming thread
+  // (which runs OnNewSample and accesses image_stream_buffer_) is fully
+  // stopped. Freeing before this point was a use-after-free.
   if (pipeline_) {
     videoflip_ = nullptr;
     gst_element_set_state(pipeline_, GST_STATE_NULL);
@@ -558,6 +635,14 @@ void Camera::Dispose() {
     gst_object_unref(pipeline_);
     pipeline_ = nullptr;
     appsink_ = nullptr;
+  }
+
+  // Now safe: the GStreamer streaming thread is guaranteed to have exited
+  // OnNewSample and will never access image_stream_buffer_ again.
+  if (image_stream_buffer_) {
+    g_free(image_stream_buffer_);
+    image_stream_buffer_ = nullptr;
+    image_stream_buffer_size_ = 0;
   }
 
   // Unregister the texture.
@@ -575,5 +660,5 @@ void Camera::Dispose() {
   fl_method_channel_invoke_method(method_channel_, "cameraClosing", args,
                                   nullptr, nullptr, nullptr);
 
-  state_ = CameraState::kDisposed;
+  state_.store(CameraState::kDisposed);
 }

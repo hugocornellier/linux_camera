@@ -50,6 +50,12 @@ class RecordHandler {
 
   bool is_recording() const { return is_recording_; }
 
+  // H-6: returns the correct file extension for the muxer that was selected.
+  // "mp4" if mp4mux is available, "mkv" if matroskamux was the fallback.
+  const char* output_extension() const {
+    return using_matroskamux_ ? "mkv" : "mp4";
+  }
+
  private:
   static GstPadProbeReturn OnEosEvent(GstPad* pad, GstPadProbeInfo* info,
                                       gpointer user_data);
@@ -79,6 +85,7 @@ class RecordHandler {
   bool is_recording_;
   bool is_setup_;
   bool has_audio_;
+  bool using_matroskamux_ = false;  // H-6: true when mp4mux was unavailable
 
   FlMethodCall* pending_stop_call_;  // Pending stop response.
 };

@@ -112,9 +112,13 @@ void camera_texture_update(CameraTexture* self,
 
   size_t required = (size_t)width * height * 4;
 
+  // --- Phase 1: ensure buffers are allocated and capture write_idx. ---
+  // The lock is held briefly only to check/update dimensions and read
+  // write_idx. Reallocation (rare — only on resolution change) also happens
+  // here, under the lock, because copy_pixels_impl may be reading
+  // buffers[read_idx] concurrently and we must not free it mid-read.
   g_mutex_lock(&self->mutex);
 
-  // Reallocate buffers if dimensions changed.
   if (required != self->buffer_size) {
     for (int i = 0; i < 3; i++) {
       g_free(self->buffers[i]);
@@ -125,10 +129,27 @@ void camera_texture_update(CameraTexture* self,
     self->height = height;
   }
 
-  // Copy frame data into the write buffer.
-  memcpy(self->buffers[self->write_idx], data, required);
+  // Capture the current write index while the lock is held. write_idx is
+  // exclusively owned by this thread (only this function ever modifies it),
+  // so it will not change between now and Phase 3.
+  int wi = self->write_idx;
 
-  // Swap write ↔ ready so the latest frame is in the ready slot.
+  g_mutex_unlock(&self->mutex);
+
+  // --- Phase 2: copy frame data into the write buffer (NO lock). ---
+  // C-6 FIX: The memcpy (up to 8 MB at 1080p) previously held the mutex for
+  // its full duration, which forced Flutter's render thread to stall every
+  // time it called copy_pixels_impl. Moving it outside the lock eliminates
+  // that contention. This is safe because:
+  //   - write_idx is producer-exclusive (only this function touches it).
+  //   - The consumer (copy_pixels_impl) only ever swaps ready_idx ↔ read_idx,
+  //     never write_idx. So buffers[wi] is not touched by any other thread
+  //     while we're here.
+  memcpy(self->buffers[wi], data, required);
+
+  // --- Phase 3: atomically swap write ↔ ready under the lock. ---
+  g_mutex_lock(&self->mutex);
+
   int tmp = self->write_idx;
   self->write_idx = self->ready_idx;
   self->ready_idx = tmp;

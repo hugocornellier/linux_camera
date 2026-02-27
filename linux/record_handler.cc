@@ -2,6 +2,13 @@
 
 #include <cstdio>
 
+// H-5: Maximum recording queue size.
+// Bounds RAM consumed by the recording branch if the encoder falls behind
+// (e.g., during an antivirus scan or CPU spike). Backpressure will propagate
+// upstream rather than silently consuming all available memory.
+static const guint64 kRecQueueMaxTimeNs = 3 * GST_SECOND;  // 3 s time limit
+static const guint kRecQueueMaxBytes = 256 * 1024 * 1024;  // 256 MB hard cap
+
 // Video encoder candidates in order of preference.
 static const char* kEncoderCandidates[] = {
     "x264enc",
@@ -92,7 +99,16 @@ bool RecordHandler::Setup(GstElement* pipeline, GstElement* tee,
   valve_ = gst_element_factory_make("valve", "rec_valve");
   videoconvert_ = gst_element_factory_make("videoconvert", "rec_convert");
   encoder_ = gst_element_factory_make(encoder_name_.c_str(), "rec_encoder");
-  muxer_ = gst_element_factory_make("matroskamux", "rec_mux");
+
+  // H-6: prefer mp4mux so the output file is a genuine MP4 container.
+  // Fall back to matroskamux if mp4mux is unavailable; the output extension
+  // is set accordingly in camera.cc so the container and extension always match.
+  muxer_ = gst_element_factory_make("mp4mux", "rec_mux");
+  if (!muxer_) {
+    muxer_ = gst_element_factory_make("matroskamux", "rec_mux");
+    using_matroskamux_ = true;
+  }
+
   filesink_ = gst_element_factory_make("filesink", "rec_filesink");
 
   if (!queue_ || !valve_ || !videoconvert_ || !encoder_ ||
@@ -105,9 +121,16 @@ bool RecordHandler::Setup(GstElement* pipeline, GstElement* tee,
   // Configure the valve to start closed (dropping all data).
   g_object_set(valve_, "drop", TRUE, nullptr);
 
-  // Configure the queue for recording.
-  g_object_set(queue_, "max-size-buffers", 100, "max-size-time", (guint64)0,
-               "max-size-bytes", 0, nullptr);
+  // H-5: bound the recording queue so the process cannot OOM if the encoder
+  // stalls. Use time-based limiting (3 s) plus a 256 MB hard cap.
+  // leaky=no means backpressure propagates upstream rather than silently
+  // dropping frames, preserving recording integrity.
+  g_object_set(queue_,
+               "max-size-buffers", (guint)0,
+               "max-size-time",    kRecQueueMaxTimeNs,
+               "max-size-bytes",   kRecQueueMaxBytes,
+               "leaky",            (gint)0,  // GST_QUEUE_NO_LEAK
+               nullptr);
 
   // Configure encoder settings based on type.
   if (encoder_name_ == "x264enc") {
@@ -320,16 +343,8 @@ void RecordHandler::StopRecording(FlMethodCall* method_call) {
     return;
   }
 
-  // Close the video valve to stop new data flowing.
-  g_object_set(valve_, "drop", TRUE, nullptr);
-
-  // Close the audio valve if audio is enabled.
-  if (has_audio_ && audio_valve_) {
-    g_object_set(audio_valve_, "drop", TRUE, nullptr);
-  }
-
-  // Set up an EOS probe on the filesink's sink pad to know when the file is
-  // done.
+  // Set up an EOS probe on the filesink's sink pad BEFORE sending EOS so we
+  // don't miss the event.
   GstPad* filesink_pad = gst_element_get_static_pad(filesink_, "sink");
 
   StopRecordingData* data = new StopRecordingData();
@@ -343,15 +358,28 @@ void RecordHandler::StopRecording(FlMethodCall* method_call) {
     gst_object_unref(filesink_pad);
   }
 
-  // Send EOS to the encoder's sink pad to flush the recording branch.
-  GstPad* encoder_sink = gst_element_get_static_pad(encoder_, "sink");
-  if (encoder_sink) {
-    gst_pad_send_event(encoder_sink, gst_event_new_eos());
-    gst_object_unref(encoder_sink);
+  // M-5 FIX: Send EOS to the valve's sink pad (not the encoder's sink pad).
+  // The GStreamer valve element passes events (including EOS) downstream even
+  // when drop=TRUE. Sending EOS here propagates correctly through the full
+  // chain: valve → videoconvert → encoder → muxer → filesink, giving each
+  // element a chance to flush its internal state before the file is closed.
+  //
+  // Close the valve AFTER sending EOS so that EOS is ordered after any frames
+  // still in-flight between the tee and the valve's input.
+  GstPad* valve_sink = gst_element_get_static_pad(valve_, "sink");
+  if (valve_sink) {
+    gst_pad_send_event(valve_sink, gst_event_new_eos());
+    gst_object_unref(valve_sink);
   }
+  // Now close the valve to block any subsequent tee data from entering the
+  // recording branch (the EOS already committed the end of the stream).
+  g_object_set(valve_, "drop", TRUE, nullptr);
 
-  // Also send EOS on the audio branch if present.
+  // Audio branch: close the audio valve and send EOS to the audio encoder.
   if (has_audio_ && audio_encoder_) {
+    if (audio_valve_) {
+      g_object_set(audio_valve_, "drop", TRUE, nullptr);
+    }
     GstPad* audio_enc_sink =
         gst_element_get_static_pad(audio_encoder_, "sink");
     if (audio_enc_sink) {

@@ -22,6 +22,9 @@ enum class CameraState {
   kDisposed,
 };
 
+// Alias for the image-stream callback function pointer type.
+using ImageStreamCallback = void (*)(int32_t);
+
 struct CameraConfig {
   std::string device_path;
   int resolution_preset;
@@ -95,7 +98,9 @@ class Camera {
 
   int camera_id_;
   int64_t texture_id_;
-  CameraState state_;
+  // state_ is written from the GStreamer streaming thread (OnNewSample) and
+  // read/written from the main thread. Must be atomic. (C-2)
+  std::atomic<CameraState> state_;
   CameraConfig config_;
 
   FlTextureRegistrar* texture_registrar_;  // Not owned.
@@ -112,12 +117,23 @@ class Camera {
   std::unique_ptr<RecordHandler> record_handler_;
 
   // Pending async initialization — stores the FlMethodCall until first frame.
+  // Only accessed from the main thread (set in Initialize, cleared in
+  // RespondToPendingInit which is always dispatched via g_idle_add to main).
   FlMethodCall* pending_init_call_;
-  bool first_frame_received_;
-  bool preview_paused_;
+
+  // Written from the GStreamer streaming thread; read from main thread. (C-2)
+  std::atomic<bool> first_frame_received_;
+
+  // Read from GStreamer streaming thread, written from main thread. (C-3)
+  std::atomic<bool> preview_paused_;
+
   std::atomic<bool> image_streaming_;
 
   // FFI image stream shared buffer.
+  // NOTE: The |ready| field acts as a release/acquire flag between the
+  // GStreamer thread (writer) and Dart (reader). The native side MUST issue a
+  // std::atomic_thread_fence(release) before writing ready=1, ensuring all
+  // pixel writes are visible before Dart observes ready==1. (C-5)
   struct ImageStreamBuffer {
     int64_t  sequence;
     int32_t  width;
@@ -131,11 +147,17 @@ class Camera {
 
   ImageStreamBuffer* image_stream_buffer_ = nullptr;
   size_t image_stream_buffer_size_ = 0;
-  void (*image_stream_callback_)(int32_t) = nullptr;
+
+  // Written from the main thread, read from the GStreamer streaming thread.
+  // Must be atomic to avoid data races and torn reads. (C-4)
+  std::atomic<ImageStreamCallback> image_stream_callback_{nullptr};
+
   int64_t image_stream_sequence_ = 0;
 
-  int actual_width_;
-  int actual_height_;
+  // Written from the GStreamer streaming thread on first frame, read from the
+  // main thread in StartVideoRecording. Must be atomic. (H-2)
+  std::atomic<int> actual_width_;
+  std::atomic<int> actual_height_;
 };
 
 #endif  // CAMERA_H_
