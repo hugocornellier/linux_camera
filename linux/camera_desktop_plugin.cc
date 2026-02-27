@@ -3,6 +3,9 @@
 #include <flutter_linux/flutter_linux.h>
 #include <gst/gst.h>
 
+// FFI bridge — defined in image_stream_ffi.cc.
+extern "C" void camera_desktop_ffi_set_plugin(void* plugin);
+
 #include <map>
 #include <memory>
 #include <string>
@@ -324,10 +327,7 @@ void camera_desktop_plugin_register_with_registrar(
       plugin->channel, method_call_cb, g_object_ref(plugin), g_object_unref);
 
   // Set the global plugin instance for FFI access.
-  {
-    extern void camera_desktop_ffi_set_plugin(void* plugin);
-    camera_desktop_ffi_set_plugin(plugin);
-  }
+  camera_desktop_ffi_set_plugin(plugin);
 
   g_object_unref(plugin);
 }

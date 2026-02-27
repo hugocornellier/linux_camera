@@ -1,3 +1,7 @@
+## 0.0.5
+
+* Fix C linkage on Linux
+
 ## 0.0.4
 
 * FFI-based image stream for reduced memory copies (3→2 per frame)
