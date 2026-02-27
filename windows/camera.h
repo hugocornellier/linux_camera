@@ -140,7 +140,7 @@ class Camera {
     int32_t  format;       // 0=BGRA, 1=RGBA
     int32_t  ready;        // 1=Dart may read, 0=native writing
     int32_t  _pad;
-    uint8_t  pixels[];     // flexible array member
+    uint8_t  pixels[1];    // flexible array member (MSVC-compatible)
   };
 
   // FFI shared buffer (replaces MethodChannel slot for FFI-enabled consumers).
