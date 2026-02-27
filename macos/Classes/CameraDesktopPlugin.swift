@@ -14,6 +14,7 @@ public class CameraDesktopPlugin: NSObject, FlutterPlugin {
     }
 
     private var sessions: [Int: CameraSession] = [:]
+    private let sessionsLock = UnfairLock()
     private var nextCameraId = 1
     private let textureRegistry: FlutterTextureRegistry
     private let methodChannel: FlutterMethodChannel
@@ -130,7 +131,9 @@ public class CameraDesktopPlugin: NSObject, FlutterPlugin {
             return
         }
 
+        sessionsLock.lock()
         sessions[cameraId] = session
+        sessionsLock.unlock()
 
         result([
             "cameraId": cameraId,
@@ -202,27 +205,38 @@ public class CameraDesktopPlugin: NSObject, FlutterPlugin {
             return
         }
 
-        if let session = sessions.removeValue(forKey: cameraId) {
-            session.dispose()
-        }
+        sessionsLock.lock()
+        let session = sessions.removeValue(forKey: cameraId)
+        sessionsLock.unlock()
+
+        session?.dispose()
         result(nil)
     }
 
     // MARK: - FFI Bridge
 
     @objc public func getImageStreamBuffer(forCamera cameraId: Int) -> UnsafeMutableRawPointer? {
-        return sessions[cameraId]?.getImageStreamBufferPointer()
+        sessionsLock.lock()
+        let session = sessions[cameraId]
+        sessionsLock.unlock()
+        return session?.getImageStreamBufferPointer()
     }
 
     @objc public func registerImageStreamCallback(
         _ callback: @convention(c) (Int32) -> Void,
         forCamera cameraId: Int
     ) {
-        sessions[cameraId]?.registerImageStreamCallback(callback)
+        sessionsLock.lock()
+        let session = sessions[cameraId]
+        sessionsLock.unlock()
+        session?.registerImageStreamCallback(callback)
     }
 
     @objc public func unregisterImageStreamCallback(forCamera cameraId: Int) {
-        sessions[cameraId]?.unregisterImageStreamCallback()
+        sessionsLock.lock()
+        let session = sessions[cameraId]
+        sessionsLock.unlock()
+        session?.unregisterImageStreamCallback()
     }
 
     // MARK: - Helpers

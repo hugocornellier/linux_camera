@@ -15,5 +15,5 @@ for camera capture, preview, photo capture, and video recording.
   s.platform         = :osx, '10.15'
   s.swift_version    = '5.0'
 
-  s.frameworks       = 'AVFoundation', 'CoreMedia', 'CoreVideo', 'CoreImage'
+  s.frameworks       = 'AVFoundation', 'CoreMedia', 'CoreVideo', 'CoreImage', 'QuartzCore'
 end

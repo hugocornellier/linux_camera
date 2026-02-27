@@ -4,7 +4,7 @@ import CoreVideo
 /// Thread-safe FlutterTexture that delivers CVPixelBuffer frames to Flutter's renderer.
 class CameraTexture: NSObject, FlutterTexture {
     private var latestBuffer: CVPixelBuffer?
-    private let lock = NSLock()
+    private let lock = UnfairLock()
 
     /// Updates the pixel buffer with a new frame from the camera.
     /// Called from the AVCaptureVideoDataOutput callback queue.

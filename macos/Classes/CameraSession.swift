@@ -1,8 +1,10 @@
 import AVFoundation
 import FlutterMacOS
+import QuartzCore
 
 /// Manages a persistent shared buffer for zero-copy FFI image stream delivery.
 /// Native writes frame data here; Dart reads it directly via FFI pointer.
+/// Uses a double-buffer strategy so writeFrame() never holds the lock during memcpy.
 class ImageStreamFFI {
     // Buffer layout matches C struct ImageStreamBuffer:
     //   int64_t sequence (8 bytes, offset 0)
@@ -15,16 +17,18 @@ class ImageStreamFFI {
     //   uint8_t pixels[] (offset 32)
     static let headerSize = 32
 
-    private var buffer: UnsafeMutableRawPointer?
-    private var bufferSize: Int = 0
+    private var buffers: (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) = (nil, nil)
+    private var bufferSizes: (Int, Int) = (0, 0)
+    private var frontIndex: Int = 0  // 0 or 1 — which buffer Dart reads from
     private var callback: (@convention(c) (Int32) -> Void)?
     private var sequence: Int64 = 0
-    private let lock = NSLock()
+    private let lock = UnfairLock()
 
     func getBufferPointer() -> UnsafeMutableRawPointer? {
         lock.lock()
-        defer { lock.unlock() }
-        return buffer
+        let idx = frontIndex
+        lock.unlock()
+        return idx == 0 ? buffers.0 : buffers.1
     }
 
     var hasCallback: Bool {
@@ -56,21 +60,31 @@ class ImageStreamFFI {
         let dataSize = bytesPerRow * height
         let totalSize = ImageStreamFFI.headerSize + dataSize
 
+        // Determine back buffer index (brief lock)
         lock.lock()
+        let backIdx = 1 - frontIndex
+        lock.unlock()
 
-        if bufferSize < totalSize {
-            buffer?.deallocate()
-            buffer = UnsafeMutableRawPointer.allocate(byteCount: totalSize, alignment: 8)
-            bufferSize = totalSize
+        // Ensure back buffer is large enough (only the back buffer is reallocated)
+        let backSize = backIdx == 0 ? bufferSizes.0 : bufferSizes.1
+        var backBuf = backIdx == 0 ? buffers.0 : buffers.1
+
+        if backSize < totalSize {
+            backBuf?.deallocate()
+            backBuf = UnsafeMutableRawPointer.allocate(byteCount: totalSize, alignment: 8)
+            if backIdx == 0 {
+                buffers.0 = backBuf
+                bufferSizes.0 = totalSize
+            } else {
+                buffers.1 = backBuf
+                bufferSizes.1 = totalSize
+            }
         }
 
-        guard let buf = buffer else {
-            lock.unlock()
-            return
-        }
+        guard let buf = backBuf else { return }
 
-        buf.storeBytes(of: Int32(0), toByteOffset: 24, as: Int32.self)
-
+        // Write to back buffer — no lock held during memcpy
+        buf.storeBytes(of: Int32(0), toByteOffset: 24, as: Int32.self) // ready=0
         memcpy(buf.advanced(by: ImageStreamFFI.headerSize), baseAddress, dataSize)
 
         sequence += 1
@@ -78,9 +92,12 @@ class ImageStreamFFI {
         buf.storeBytes(of: Int32(width), toByteOffset: 8, as: Int32.self)
         buf.storeBytes(of: Int32(height), toByteOffset: 12, as: Int32.self)
         buf.storeBytes(of: Int32(bytesPerRow), toByteOffset: 16, as: Int32.self)
-        buf.storeBytes(of: Int32(0), toByteOffset: 20, as: Int32.self)
-        buf.storeBytes(of: Int32(1), toByteOffset: 24, as: Int32.self)
+        buf.storeBytes(of: Int32(0), toByteOffset: 20, as: Int32.self) // format=BGRA
+        buf.storeBytes(of: Int32(1), toByteOffset: 24, as: Int32.self) // ready=1
 
+        // Swap front/back and grab callback — brief lock
+        lock.lock()
+        frontIndex = backIdx
         let cb = callback
         lock.unlock()
 
@@ -88,7 +105,8 @@ class ImageStreamFFI {
     }
 
     deinit {
-        buffer?.deallocate()
+        buffers.0?.deallocate()
+        buffers.1?.deallocate()
     }
 }
 
@@ -112,8 +130,11 @@ class CameraSession: NSObject {
     private let captureQueue = DispatchQueue(label: "com.hugocornellier.camera_desktop.capture")
     private let audioQueue = DispatchQueue(label: "com.hugocornellier.camera_desktop.audio")
     private let sessionQueue = DispatchQueue(label: "com.hugocornellier.camera_desktop.session")
-    private let bufferLock = NSLock()
-    private let flagsLock = NSLock()
+    private let bufferLock = UnfairLock()
+    private let flagsLock = UnfairLock()
+
+    private var lastTextureNotification: CFTimeInterval = 0
+    private let textureNotificationInterval: CFTimeInterval = 1.0 / 120.0
 
     private var recordHandler = RecordHandler()
     private let imageStreamFFI = ImageStreamFFI()
@@ -254,6 +275,7 @@ class CameraSession: NSObject {
 
         // Add video output.
         let vOutput = AVCaptureVideoDataOutput()
+        vOutput.alwaysDiscardsLateVideoFrames = true
         vOutput.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
         ]
@@ -489,9 +511,13 @@ extension CameraSession: AVCaptureVideoDataOutputSampleBufferDelegate,
         // Update the texture for Flutter preview.
         if !previewPaused || isFirstFrame {
             texture?.update(buffer: pixelBuffer)
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self, let registry = self.textureRegistry else { return }
-                registry.textureFrameAvailable(self.textureId)
+            let now = CACurrentMediaTime()
+            if isFirstFrame || (now - lastTextureNotification) >= textureNotificationInterval {
+                lastTextureNotification = now
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self, let registry = self.textureRegistry else { return }
+                    registry.textureFrameAvailable(self.textureId)
+                }
             }
         }
 

@@ -1,6 +1,5 @@
 import AVFoundation
 import CoreImage
-import AppKit
 
 /// Captures a still image from a CVPixelBuffer and writes it to a JPEG file.
 class PhotoHandler {
@@ -10,23 +9,14 @@ class PhotoHandler {
     /// Returns true on success, false on failure.
     static func takePicture(from buffer: CVPixelBuffer, outputPath: String) -> Bool {
         let ciImage = CIImage(cvPixelBuffer: buffer)
-
-        let width = CVPixelBufferGetWidth(buffer)
-        let height = CVPixelBufferGetHeight(buffer)
-
-        guard let cgImage = ciContext.createCGImage(ciImage,
-                                                     from: CGRect(x: 0, y: 0,
-                                                                  width: width,
-                                                                  height: height)) else {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let jpegData = ciContext.jpegRepresentation(
+            of: ciImage,
+            colorSpace: colorSpace,
+            options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.9]
+        ) else {
             return false
         }
-
-        let bitmapRep = NSBitmapImageRep(cgImage: cgImage)
-        guard let jpegData = bitmapRep.representation(using: .jpeg,
-                                                       properties: [.compressionFactor: 0.9]) else {
-            return false
-        }
-
         let url = URL(fileURLWithPath: outputPath)
         do {
             try jpegData.write(to: url)

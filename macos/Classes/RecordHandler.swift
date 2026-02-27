@@ -7,7 +7,7 @@ class RecordHandler: NSObject {
     private var audioInput: AVAssetWriterInput?
     private var outputPath: String?
     private var sessionStarted = false
-    private let lock = NSLock()
+    private let lock = UnfairLock()
 
     private(set) var isRecording = false
 
@@ -94,9 +94,9 @@ class RecordHandler: NSObject {
             writer.startSession(atSourceTime: timestamp)
             sessionStarted = true
         }
+        lock.unlock()
 
         input.append(sampleBuffer)
-        lock.unlock()
     }
 
     /// Appends an audio sample buffer to the recording.
@@ -111,9 +111,9 @@ class RecordHandler: NSObject {
             lock.unlock()
             return
         }
+        lock.unlock()
 
         input.append(sampleBuffer)
-        lock.unlock()
     }
 
     /// Stops recording and finalizes the file.
