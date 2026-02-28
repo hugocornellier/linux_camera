@@ -10,7 +10,7 @@ for camera capture, preview, photo capture, and video recording.
   s.license          = { :type => 'MIT', :file => '../LICENSE' }
   s.author           = { 'Hugo Cornellier' => 'hugo@hugocornellier.com' }
   s.source           = { :http => 'https://github.com/hugocornellier/camera_desktop' }
-  s.source_files     = 'Classes/**/*'
+  s.source_files     = 'camera_desktop/Sources/camera_desktop/**/*'
   s.dependency 'FlutterMacOS'
   s.platform         = :osx, '10.15'
   s.swift_version    = '5.0'

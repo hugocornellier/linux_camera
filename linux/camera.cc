@@ -99,13 +99,13 @@ bool Camera::BuildPipeline(GError** error) {
       "v4l2src device=%s "
       "! videoconvert "
       "! videoflip name=flip method=horizontal-flip "
-      "! video/x-raw,format=RGBA,width=%d,height=%d "
+      "! video/x-raw,format=RGBA,width=%d,height=%d,framerate=%d/1 "
       "! tee name=t "
       "t. ! queue name=preview_queue ! "
       "appsink name=sink emit-signals=true max-buffers=2 drop=true "
       "sync=false",
       config_.device_path.c_str(), config_.target_width,
-      config_.target_height);
+      config_.target_height, config_.target_fps);
 
   pipeline_ = gst_parse_launch(pipeline_str, error);
   g_free(pipeline_str);
@@ -522,6 +522,8 @@ void Camera::StartVideoRecording(FlMethodCall* method_call) {
     if (!record_handler_->Setup(pipeline_, tee_,
                                 actual_width_.load(), actual_height_.load(),
                                 config_.target_fps,
+                                config_.target_bitrate,
+                                config_.audio_bitrate,
                                 config_.enable_audio, &error)) {
       g_autoptr(FlValue) details = fl_value_new_null();
       fl_method_call_respond_error(
@@ -530,6 +532,10 @@ void Camera::StartVideoRecording(FlMethodCall* method_call) {
           nullptr);
       if (error) g_error_free(error);
       return;
+    }
+    if (config_.enable_audio && !record_handler_->has_audio()) {
+      SendError("Audio recording was requested but audio setup failed. "
+                "Recording will continue without audio.");
     }
   }
 

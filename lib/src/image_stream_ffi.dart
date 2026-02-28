@@ -17,46 +17,61 @@ import 'package:camera_platform_interface/camera_platform_interface.dart';
 ///   int32_t _pad          (offset 28)
 ///   uint8_t pixels[]      (offset 32)
 final class ImageStreamBuffer extends Struct {
+  /// Frame sequence number, incremented by native code for each new frame.
   @Int64()
   external int sequence;
 
+  /// Frame width in pixels.
   @Int32()
   external int width;
 
+  /// Frame height in pixels.
   @Int32()
   external int height;
 
+  /// Number of bytes per row (may include padding beyond width * 4).
   @Int32()
   external int bytesPerRow;
 
+  /// Pixel format: 0 = BGRA (macOS), 1 = RGBA (Linux/Windows).
   @Int32()
   external int format;
 
+  /// Ready flag: 1 = Dart may read, 0 = native is writing.
   @Int32()
   external int ready;
 
+  /// Padding for 8-byte alignment.
   @Int32()
   // ignore: unused_field
   external int _pad;
 }
 
-/// Native function signatures.
-typedef _GetBufferNative = Pointer<Void> Function(Int32 cameraId);
-typedef _GetBufferDart = Pointer<Void> Function(int cameraId);
+/// Native function signature for retrieving the shared image buffer pointer.
+typedef _GetBufferNative = Pointer<Void> Function(Int64 streamHandle);
 
+/// Dart-side function type for [_GetBufferNative].
+typedef _GetBufferDart = Pointer<Void> Function(int streamHandle);
+
+/// Native function signature for registering a frame-ready callback.
 typedef _RegisterCallbackNative =
     Void Function(
-      Int32 cameraId,
-      Pointer<NativeFunction<Void Function(Int32)>> callback,
-    );
-typedef _RegisterCallbackDart =
-    void Function(
-      int cameraId,
+      Int64 streamHandle,
       Pointer<NativeFunction<Void Function(Int32)>> callback,
     );
 
-typedef _UnregisterCallbackNative = Void Function(Int32 cameraId);
-typedef _UnregisterCallbackDart = void Function(int cameraId);
+/// Dart-side function type for [_RegisterCallbackNative].
+typedef _RegisterCallbackDart =
+    void Function(
+      int streamHandle,
+      Pointer<NativeFunction<Void Function(Int32)>> callback,
+    );
+
+/// Native function signature for unregistering a frame-ready callback.
+typedef _UnregisterCallbackNative = Void Function(Int64 streamHandle);
+
+/// Dart-side function type for [_UnregisterCallbackNative].
+typedef _UnregisterCallbackDart = void Function(int streamHandle);
 
 /// Manages FFI-based image stream for a single camera.
 ///
@@ -68,25 +83,39 @@ typedef _UnregisterCallbackDart = void Function(int cameraId);
 /// null from [tryCreate] and the caller falls back to MethodChannel.
 class ImageStreamFfi {
   ImageStreamFfi._(
-    this._cameraId,
+    this._streamHandle,
     this._getBuffer,
     this._registerCallback,
     this._unregisterCallback,
   );
 
-  final int _cameraId;
+  /// The native stream handle used to identify this stream to native code.
+  final int _streamHandle;
+
+  /// FFI function to retrieve the shared buffer pointer.
   final _GetBufferDart _getBuffer;
+
+  /// FFI function to register a frame-ready callback with native code.
   final _RegisterCallbackDart _registerCallback;
+
+  /// FFI function to unregister the frame-ready callback.
   final _UnregisterCallbackDart _unregisterCallback;
 
+  /// The native callable that receives frame-ready notifications from any
+  /// native thread and delivers them to the Dart isolate's event loop.
   NativeCallable<Void Function(Int32)>? _nativeCallable;
+
+  /// The stream controller to which decoded frames are added.
   StreamController<CameraImageData>? _controller;
+
+  /// The sequence number of the last frame delivered, used to skip duplicates.
   int _lastSequence = 0;
 
   /// Attempts to set up the FFI image stream.
   ///
-  /// Returns null if the native library or symbols cannot be found.
-  static ImageStreamFfi? tryCreate(int cameraId) {
+  /// Returns null if the native library or required symbols cannot be found,
+  /// allowing the caller to fall back to MethodChannel frame delivery.
+  static ImageStreamFfi? tryCreate(int streamHandle) {
     try {
       final lib = _loadNativeLibrary();
 
@@ -103,26 +132,27 @@ class ImageStreamFfi {
           );
 
       return ImageStreamFfi._(
-        cameraId,
+        streamHandle,
         getBuffer,
         registerCallback,
         unregisterCallback,
       );
     } catch (_) {
-      // Symbol lookup or library loading failed — fall back to MethodChannel.
       return null;
     }
   }
 
+  /// Loads the native library containing the FFI image stream symbols.
+  ///
+  /// On all desktop platforms, the plugin's native code is compiled into a
+  /// shared library loaded by the Flutter engine. [DynamicLibrary.process]
+  /// searches the current process's symbol table. On Windows, falls back to
+  /// explicitly opening `camera_desktop_plugin.dll` if process lookup fails.
   static DynamicLibrary _loadNativeLibrary() {
-    // On all desktop platforms, the plugin's native code is compiled into
-    // a shared library loaded by the Flutter engine. DynamicLibrary.process()
-    // searches the current process's symbol table.
     if (Platform.isMacOS || Platform.isLinux) {
       return DynamicLibrary.process();
     }
     if (Platform.isWindows) {
-      // On Windows, try process first, then explicit DLL name.
       try {
         return DynamicLibrary.process();
       } catch (_) {
@@ -141,22 +171,26 @@ class ImageStreamFfi {
       _onFrameReady,
     );
 
-    _registerCallback(_cameraId, _nativeCallable!.nativeFunction);
+    _registerCallback(_streamHandle, _nativeCallable!.nativeFunction);
   }
 
   /// Called from any native thread when a new frame is ready.
-  /// Delivered to the Dart isolate's event loop by NativeCallable.listener.
-  void _onFrameReady(int cameraId) {
+  ///
+  /// Delivered to the Dart isolate's event loop by
+  /// [NativeCallable.listener]. Reads the shared buffer, skips duplicate
+  /// frames by comparing sequence numbers, creates a zero-copy view over
+  /// the native pixel buffer, then copies into a Dart-owned [Uint8List]
+  /// (1 copy — required by the platform interface contract).
+  void _onFrameReady(int _) {
     final controller = _controller;
     if (controller == null || controller.isClosed) return;
 
-    final bufPtr = _getBuffer(_cameraId);
+    final bufPtr = _getBuffer(_streamHandle);
     if (bufPtr == nullptr) return;
 
     final buf = bufPtr.cast<ImageStreamBuffer>().ref;
     if (buf.ready != 1) return;
 
-    // Skip duplicate frames.
     if (buf.sequence <= _lastSequence) return;
     _lastSequence = buf.sequence;
 
@@ -166,11 +200,9 @@ class ImageStreamFfi {
     final format = buf.format;
     final dataSize = bytesPerRow * height;
 
-    // Create a zero-copy view over the native pixel buffer.
     final pixelsPtr = bufPtr.cast<Uint8>() + sizeOf<ImageStreamBuffer>();
     final nativeView = pixelsPtr.asTypedList(dataSize);
 
-    // Copy into a Dart-owned Uint8List (1 copy — required by platform interface).
     final bytes = Uint8List.fromList(nativeView);
 
     final rawFormat = format == 0 ? 'BGRA' : 'RGBA';
@@ -195,7 +227,7 @@ class ImageStreamFfi {
 
   /// Unregisters the native callback.
   void stop() {
-    _unregisterCallback(_cameraId);
+    _unregisterCallback(_streamHandle);
   }
 
   /// Releases all resources.

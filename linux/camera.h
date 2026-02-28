@@ -32,6 +32,8 @@ struct CameraConfig {
   int target_width;
   int target_height;
   int target_fps;
+  int target_bitrate;
+  int audio_bitrate = 0;
 };
 
 class Camera {

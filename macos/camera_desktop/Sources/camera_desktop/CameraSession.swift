@@ -163,6 +163,9 @@ class CameraSession: NSObject {
         let deviceId: String
         let resolutionPreset: Int
         let enableAudio: Bool
+        let targetFps: Int
+        let targetBitrate: Int
+        let audioBitrate: Int
     }
 
     init(cameraId: Int, config: CameraConfig,
@@ -358,6 +361,9 @@ class CameraSession: NSObject {
                 let path = try self.recordHandler.startRecording(
                     width: self.actualWidth,
                     height: self.actualHeight,
+                    targetFps: self.config.targetFps,
+                    targetBitrate: self.config.targetBitrate,
+                    audioBitrate: self.config.audioBitrate,
                     enableAudio: enableAudio
                 )
                 _ = path

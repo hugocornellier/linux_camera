@@ -10,10 +10,16 @@
 
 #include <memory>
 #include <string>
+#include <thread>
+#include <cstdint>
 
 #include "device_enumerator.h"
 
 CameraDesktopPlugin* CameraDesktopPlugin::instance_ = nullptr;
+
+int64_t camera_desktop_ffi_register_stream_handle(Camera* camera);
+void camera_desktop_ffi_release_stream_handle(int64_t stream_handle);
+void camera_desktop_ffi_release_handles_for_camera(Camera* camera);
 
 // ---------------------------------------------------------------------------
 // C export — called by generated_plugin_registrant.cc
@@ -35,7 +41,7 @@ void CameraDesktopPlugin::RegisterWithRegistrar(
     flutter::PluginRegistrarWindows* registrar) {
   // One-time Media Foundation startup (reference-counted internally).
   MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
-  CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  const HRESULT co_hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
   auto channel = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
       registrar->messenger(), "plugins.flutter.io/camera_desktop",
@@ -43,6 +49,7 @@ void CameraDesktopPlugin::RegisterWithRegistrar(
 
   auto plugin = std::make_unique<CameraDesktopPlugin>(registrar,
                                                        std::move(channel));
+  plugin->should_co_uninitialize_ = (co_hr == S_OK || co_hr == S_FALSE);
   instance_ = plugin.get();
 
   plugin->channel_->SetMethodCallHandler(
@@ -59,12 +66,20 @@ CameraDesktopPlugin::CameraDesktopPlugin(
     : registrar_(registrar), channel_(std::move(channel)) {}
 
 CameraDesktopPlugin::~CameraDesktopPlugin() {
+  shutting_down_ = true;
   instance_ = nullptr;
-  for (auto& [id, camera] : cameras_) {
-    camera->Dispose();
+  {
+    std::lock_guard<std::mutex> lk(cameras_mutex_);
+    for (auto& [id, camera] : cameras_) {
+      camera_desktop_ffi_release_handles_for_camera(camera.get());
+      camera->Dispose();
+    }
+    cameras_.clear();
   }
-  cameras_.clear();
   MFShutdown();
+  if (should_co_uninitialize_) {
+    CoUninitialize();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -82,6 +97,8 @@ void CameraDesktopPlugin::HandleMethodCall(
 
   if (method == "availableCameras") {
     HandleAvailableCameras(std::move(result));
+  } else if (method == "getPlatformCapabilities") {
+    HandleGetPlatformCapabilities(std::move(result));
   } else if (method == "create") {
     HandleCreate(safe_args, std::move(result));
   } else if (method == "initialize") {
@@ -100,6 +117,8 @@ void CameraDesktopPlugin::HandleMethodCall(
     HandlePausePreview(safe_args, std::move(result));
   } else if (method == "resumePreview") {
     HandleResumePreview(safe_args, std::move(result));
+  } else if (method == "setMirror") {
+    HandleSetMirror(safe_args, std::move(result));
   } else if (method == "dispose") {
     HandleDispose(safe_args, std::move(result));
   } else {
@@ -113,36 +132,54 @@ void CameraDesktopPlugin::HandleMethodCall(
 
 void CameraDesktopPlugin::HandleAvailableCameras(
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
-  auto devices = DeviceEnumerator::EnumerateVideoDevices();
+  auto* raw_result = result.release();
+  std::thread([raw_result]() {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> async_result(
+        raw_result);
 
-  flutter::EncodableList list;
-  for (const auto& device : devices) {
-    // Convert wide strings to UTF-8.
-    auto to_utf8 = [](const std::wstring& w) -> std::string {
-      if (w.empty()) return {};
-      int size = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
-                                     nullptr, 0, nullptr, nullptr);
-      std::string s(size, '\0');
-      WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), s.data(), size,
-                          nullptr, nullptr);
-      return s;
-    };
+    auto devices = DeviceEnumerator::EnumerateVideoDevices();
 
-    // Name format: "Friendly Name (symbolic_link)" — same as Linux/macOS.
-    std::string display_name =
-        to_utf8(device.friendly_name) + " (" + to_utf8(device.symbolic_link) + ")";
+    flutter::EncodableList list;
+    for (const auto& device : devices) {
+      auto to_utf8 = [](const std::wstring& w) -> std::string {
+        if (w.empty()) return {};
+        int size = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
+                                       nullptr, 0, nullptr, nullptr);
+        std::string s(size, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), s.data(), size,
+                            nullptr, nullptr);
+        return s;
+      };
 
-    list.push_back(flutter::EncodableValue(flutter::EncodableMap{
-        {flutter::EncodableValue("name"),
-         flutter::EncodableValue(display_name)},
-        {flutter::EncodableValue("lensDirection"),
-         flutter::EncodableValue(0)},  // front-facing
-        {flutter::EncodableValue("sensorOrientation"),
-         flutter::EncodableValue(0)},
-    }));
-  }
+      std::string display_name = to_utf8(device.friendly_name) + " (" +
+                                 to_utf8(device.symbolic_link) + ")";
 
-  result->Success(flutter::EncodableValue(list));
+      list.push_back(flutter::EncodableValue(flutter::EncodableMap{
+          {flutter::EncodableValue("name"),
+           flutter::EncodableValue(display_name)},
+          {flutter::EncodableValue("lensDirection"),
+           flutter::EncodableValue(0)},
+          {flutter::EncodableValue("sensorOrientation"),
+           flutter::EncodableValue(0)},
+      }));
+    }
+
+    async_result->Success(flutter::EncodableValue(list));
+    CoUninitialize();
+  }).detach();
+}
+
+void CameraDesktopPlugin::HandleGetPlatformCapabilities(
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  result->Success(flutter::EncodableValue(flutter::EncodableMap{
+      {flutter::EncodableValue("supportsMirrorControl"),
+       flutter::EncodableValue(false)},
+      {flutter::EncodableValue("supportsVideoFpsControl"),
+       flutter::EncodableValue(true)},
+      {flutter::EncodableValue("supportsVideoBitrateControl"),
+       flutter::EncodableValue(true)},
+  }));
 }
 
 void CameraDesktopPlugin::HandleCreate(
@@ -166,6 +203,48 @@ void CameraDesktopPlugin::HandleCreate(
   }
   bool enable_audio = enable_audio_ptr ? *enable_audio_ptr : false;
 
+  int target_fps = 30;
+  auto fps_it = args.find(flutter::EncodableValue("fps"));
+  if (fps_it != args.end()) {
+    if (const int* fps_int = std::get_if<int>(&fps_it->second)) {
+      target_fps = *fps_int;
+    } else if (const double* fps_double = std::get_if<double>(&fps_it->second)) {
+      target_fps = static_cast<int>(*fps_double);
+    }
+  }
+  if (target_fps < 5) target_fps = 5;
+  if (target_fps > 60) target_fps = 60;
+
+  int target_bitrate = 0;
+  auto bitrate_it = args.find(flutter::EncodableValue("videoBitrate"));
+  if (bitrate_it != args.end()) {
+    if (const int* bitrate_int = std::get_if<int>(&bitrate_it->second)) {
+      target_bitrate = *bitrate_int;
+    } else if (const int64_t* bitrate_i64 =
+                   std::get_if<int64_t>(&bitrate_it->second)) {
+      target_bitrate = static_cast<int>(*bitrate_i64);
+    } else if (const double* bitrate_double =
+                   std::get_if<double>(&bitrate_it->second)) {
+      target_bitrate = static_cast<int>(*bitrate_double);
+    }
+  }
+  if (target_bitrate < 0) target_bitrate = 0;
+
+  int audio_bitrate = 0;
+  auto audio_bitrate_it = args.find(flutter::EncodableValue("audioBitrate"));
+  if (audio_bitrate_it != args.end()) {
+    if (const int* vi = std::get_if<int>(&audio_bitrate_it->second)) {
+      audio_bitrate = *vi;
+    } else if (const int64_t* vi64 =
+                   std::get_if<int64_t>(&audio_bitrate_it->second)) {
+      audio_bitrate = static_cast<int>(*vi64);
+    } else if (const double* vd =
+                   std::get_if<double>(&audio_bitrate_it->second)) {
+      audio_bitrate = static_cast<int>(*vd);
+    }
+  }
+  if (audio_bitrate < 0) audio_bitrate = 0;
+
   std::wstring symbolic_link = DeviceEnumerator::FindSymbolicLink(*camera_name);
   if (symbolic_link.empty()) {
     result->Error("camera_not_found",
@@ -177,10 +256,12 @@ void CameraDesktopPlugin::HandleCreate(
   config.symbolic_link = symbolic_link;
   config.resolution_preset = resolution_preset;
   config.enable_audio = enable_audio;
-  config.target_fps = 30;
+  config.target_fps = target_fps;
+  config.target_bitrate = target_bitrate;
+  config.audio_bitrate = audio_bitrate;
 
   int camera_id = next_camera_id_++;
-  auto camera = std::make_unique<Camera>(
+  auto camera = std::make_shared<Camera>(
       camera_id,
       registrar_->texture_registrar(),
       channel_.get(),
@@ -193,7 +274,10 @@ void CameraDesktopPlugin::HandleCreate(
     return;
   }
 
-  cameras_[camera_id] = std::move(camera);
+  {
+    std::lock_guard<std::mutex> lk(cameras_mutex_);
+    cameras_[camera_id] = std::move(camera);
+  }
 
   result->Success(flutter::EncodableValue(flutter::EncodableMap{
       {flutter::EncodableValue("cameraId"),
@@ -203,7 +287,7 @@ void CameraDesktopPlugin::HandleCreate(
   }));
 }
 
-Camera* CameraDesktopPlugin::FindCamera(
+std::shared_ptr<Camera> CameraDesktopPlugin::FindCamera(
     const flutter::EncodableMap& args,
     flutter::MethodResult<flutter::EncodableValue>* result) {
   auto it = args.find(flutter::EncodableValue("cameraId"));
@@ -212,25 +296,29 @@ Camera* CameraDesktopPlugin::FindCamera(
     return nullptr;
   }
   int camera_id = std::get<int>(it->second);
+  std::lock_guard<std::mutex> lk(cameras_mutex_);
   auto cam_it = cameras_.find(camera_id);
-  if (cam_it == cameras_.end()) {
+  if (cam_it == cameras_.end() || cam_it->second->IsDisposedOrDisposing()) {
     result->Error("camera_not_found", "No camera with id " +
                                           std::to_string(camera_id));
-    return nullptr;
+    return {};
   }
-  return cam_it->second.get();
+  return cam_it->second;
 }
 
-Camera* CameraDesktopPlugin::FindCameraById(int camera_id) {
+void CameraDesktopPlugin::EraseCameraAfterDispose(int camera_id) {
+  if (shutting_down_) return;
+  std::lock_guard<std::mutex> lk(cameras_mutex_);
   auto it = cameras_.find(camera_id);
-  if (it == cameras_.end()) return nullptr;
-  return it->second.get();
+  if (it != cameras_.end() && it->second->IsDisposedOrDisposing()) {
+    cameras_.erase(it);
+  }
 }
 
 void CameraDesktopPlugin::HandleInitialize(
     const flutter::EncodableMap& args,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
-  Camera* camera = FindCamera(args, result.get());
+  auto camera = FindCamera(args, result.get());
   if (!camera) return;
   camera->Initialize(std::move(result));
 }
@@ -238,7 +326,7 @@ void CameraDesktopPlugin::HandleInitialize(
 void CameraDesktopPlugin::HandleTakePicture(
     const flutter::EncodableMap& args,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
-  Camera* camera = FindCamera(args, result.get());
+  auto camera = FindCamera(args, result.get());
   if (!camera) return;
   camera->TakePicture(std::move(result));
 }
@@ -246,7 +334,7 @@ void CameraDesktopPlugin::HandleTakePicture(
 void CameraDesktopPlugin::HandleStartVideoRecording(
     const flutter::EncodableMap& args,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
-  Camera* camera = FindCamera(args, result.get());
+  auto camera = FindCamera(args, result.get());
   if (!camera) return;
   camera->StartVideoRecording(std::move(result));
 }
@@ -254,7 +342,7 @@ void CameraDesktopPlugin::HandleStartVideoRecording(
 void CameraDesktopPlugin::HandleStopVideoRecording(
     const flutter::EncodableMap& args,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
-  Camera* camera = FindCamera(args, result.get());
+  auto camera = FindCamera(args, result.get());
   if (!camera) return;
   camera->StopVideoRecording(std::move(result));
 }
@@ -262,17 +350,32 @@ void CameraDesktopPlugin::HandleStopVideoRecording(
 void CameraDesktopPlugin::HandleStartImageStream(
     const flutter::EncodableMap& args,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
-  Camera* camera = FindCamera(args, result.get());
+  auto camera = FindCamera(args, result.get());
   if (!camera) return;
   camera->StartImageStream();
-  result->Success(flutter::EncodableValue(nullptr));
+  const int64_t stream_handle =
+      camera_desktop_ffi_register_stream_handle(camera.get());
+  result->Success(flutter::EncodableValue(flutter::EncodableMap{
+      {flutter::EncodableValue("streamHandle"),
+       flutter::EncodableValue(stream_handle)},
+  }));
 }
 
 void CameraDesktopPlugin::HandleStopImageStream(
     const flutter::EncodableMap& args,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
-  Camera* camera = FindCamera(args, result.get());
+  auto camera = FindCamera(args, result.get());
   if (!camera) return;
+  auto handle_it = args.find(flutter::EncodableValue("streamHandle"));
+  if (handle_it != args.end()) {
+    if (const int64_t* h64 = std::get_if<int64_t>(&handle_it->second)) {
+      camera_desktop_ffi_release_stream_handle(*h64);
+    } else if (const int* h32 = std::get_if<int>(&handle_it->second)) {
+      camera_desktop_ffi_release_stream_handle(static_cast<int64_t>(*h32));
+    } else if (const double* hd = std::get_if<double>(&handle_it->second)) {
+      camera_desktop_ffi_release_stream_handle(static_cast<int64_t>(*hd));
+    }
+  }
   camera->StopImageStream();
   result->Success(flutter::EncodableValue(nullptr));
 }
@@ -280,7 +383,7 @@ void CameraDesktopPlugin::HandleStopImageStream(
 void CameraDesktopPlugin::HandlePausePreview(
     const flutter::EncodableMap& args,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
-  Camera* camera = FindCamera(args, result.get());
+  auto camera = FindCamera(args, result.get());
   if (!camera) return;
   camera->PausePreview();
   result->Success(flutter::EncodableValue(nullptr));
@@ -289,10 +392,29 @@ void CameraDesktopPlugin::HandlePausePreview(
 void CameraDesktopPlugin::HandleResumePreview(
     const flutter::EncodableMap& args,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
-  Camera* camera = FindCamera(args, result.get());
+  auto camera = FindCamera(args, result.get());
   if (!camera) return;
   camera->ResumePreview();
   result->Success(flutter::EncodableValue(nullptr));
+}
+
+void CameraDesktopPlugin::HandleSetMirror(
+    const flutter::EncodableMap& args,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  auto camera = FindCamera(args, result.get());
+  if (!camera) return;
+
+  auto it = args.find(flutter::EncodableValue("mirrored"));
+  const bool* mirrored = (it == args.end())
+      ? nullptr
+      : std::get_if<bool>(&it->second);
+  if (!mirrored) {
+    result->Error("invalid_args", "mirrored is required");
+    return;
+  }
+  (void)mirrored;
+
+  result->Error("unsupported", "Mirror control is not supported on Windows.");
 }
 
 void CameraDesktopPlugin::HandleDispose(
@@ -301,10 +423,22 @@ void CameraDesktopPlugin::HandleDispose(
   auto it = args.find(flutter::EncodableValue("cameraId"));
   if (it != args.end()) {
     int camera_id = std::get<int>(it->second);
-    auto cam_it = cameras_.find(camera_id);
-    if (cam_it != cameras_.end()) {
-      cam_it->second->Dispose();
-      cameras_.erase(cam_it);
+    std::shared_ptr<Camera> camera;
+    {
+      std::lock_guard<std::mutex> lk(cameras_mutex_);
+      auto cam_it = cameras_.find(camera_id);
+      if (cam_it != cameras_.end()) {
+        camera = cam_it->second;
+      }
+    }
+    if (camera) {
+      camera_desktop_ffi_release_handles_for_camera(camera.get());
+      camera->DisposeAsync([camera_id]() {
+        auto* plugin = CameraDesktopPlugin::instance();
+        if (plugin) {
+          plugin->EraseCameraAfterDispose(camera_id);
+        }
+      });
     }
   }
   result->Success(flutter::EncodableValue(nullptr));

@@ -36,8 +36,8 @@ class RecordHandler {
   // |enable_audio| adds an audio source and encoder to the recording.
   // Returns true on success; sets |error| on failure.
   bool Setup(GstElement* pipeline, GstElement* tee,
-             int width, int height, int fps, bool enable_audio,
-             GError** error);
+             int width, int height, int fps, int video_bitrate,
+             int audio_bitrate, bool enable_audio, GError** error);
 
   // Starts recording to the given file path.
   // Returns true on success; sets |error| on failure.
@@ -49,6 +49,9 @@ class RecordHandler {
   void StopRecording(FlMethodCall* method_call);
 
   bool is_recording() const { return is_recording_; }
+  bool has_audio() const { return has_audio_; }
+  const std::string& encoder_name() const { return encoder_name_; }
+  const std::string& audio_encoder_name() const { return audio_encoder_name_; }
 
   // H-6: returns the correct file extension for the muxer that was selected.
   // "mp4" if mp4mux is available, "mkv" if matroskamux was the fallback.
@@ -60,7 +63,7 @@ class RecordHandler {
   static GstPadProbeReturn OnEosEvent(GstPad* pad, GstPadProbeInfo* info,
                                       gpointer user_data);
 
-  bool SetupAudioBranch(GError** error);
+  bool SetupAudioBranch(int audio_bitrate, GError** error);
 
   GstElement* pipeline_;     // Not owned.
   GstElement* tee_;          // Not owned.

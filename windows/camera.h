@@ -4,13 +4,15 @@
 #include <flutter/method_channel.h>
 #include <flutter/method_result.h>
 #include <flutter/texture_registrar.h>
+#include <d3d11.h>
 #include <mfapi.h>
+#include <mfcaptureengine.h>
 #include <mfidl.h>
-#include <mfreadwrite.h>
 #include <wrl/client.h>
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -33,12 +35,14 @@ enum class CameraState {
 
 struct CameraConfig {
   std::wstring symbolic_link;
-  int resolution_preset = 4;  // max
-  bool enable_audio = false;
-  int target_fps = 30;
+  int  resolution_preset = 4;  // 0=low … 4=max
+  bool enable_audio      = false;
+  int  target_fps        = 30;
+  int  target_bitrate    = 0;  // <=0 means use dynamic default ladder.
+  int  audio_bitrate     = 0;
 };
 
-class Camera {
+class Camera : public std::enable_shared_from_this<Camera> {
  public:
   Camera(int camera_id, flutter::TextureRegistrar* texture_registrar,
          flutter::MethodChannel<flutter::EncodableValue>* channel,
@@ -63,94 +67,121 @@ class Camera {
 
   // FFI image stream access.
   void* GetImageStreamBuffer();
-  void RegisterImageStreamCallback(void (*callback)(int32_t));
-  void UnregisterImageStreamCallback();
+  void  RegisterImageStreamCallback(void (*callback)(int32_t));
+  void  UnregisterImageStreamCallback();
 
   void PausePreview();
   void ResumePreview();
+  void DisposeAsync(std::function<void()> on_done);
   void Dispose();
+  bool IsDisposedOrDisposing() const;
+
+  // Called from COM callbacks — must be public.
+  void OnEngineEvent(IMFMediaEvent* event);
+  void OnPreviewSample(IMFSample* sample);
 
  private:
-  static std::pair<int, int> ResolutionForPreset(int preset);
+  uint32_t MaxPreviewHeightForPreset() const;
+  uint32_t MaxRecordHeightForPreset() const;
+  int ComputeDefaultBitrate(int width, int height, int fps) const;
 
-  bool BuildSourceReader(std::string* error);
-  void CaptureLoop();
+  HRESULT CreateCaptureEngine();
+  HRESULT FindBaseMediaTypes();
+  HRESULT StartPreviewInternal();
 
-  // P7a: horizontal mirror only (BGRA → mirrored BGRA).
-  // Applied before photo / recorder copies so all outputs are mirrored.
+  void CompleteInit(bool success, const std::string& error,
+                    int width = 0, int height = 0);
+  void FailAllPendingResults(const std::string& error);
+
+  void DisposeInternal();
+  void SendError(const std::string& description);
+
   static void FlipHorizontal(uint8_t* data, int width, int height);
-
-  // P7b: R↔B channel swap in-place (mirrored BGRA → mirrored RGBA).
-  // Applied after photo / recorder copies, for the Flutter texture only.
   static void SwapRBChannels(uint8_t* data, int width, int height);
 
   void PostImageStreamFrame(const uint8_t* data, int width, int height);
   void ImageStreamLoop();
-  void SendError(const std::string& description);
 
-  int camera_id_;
-  int64_t texture_id_ = -1;
+  // ── Identity ────────────────────────────────────────────────────────────
+  int        camera_id_;
+  int64_t    texture_id_ = -1;
   CameraConfig config_;
 
-  flutter::TextureRegistrar* texture_registrar_;
-  flutter::MethodChannel<flutter::EncodableValue>* channel_;
-  std::unique_ptr<CameraTexture> texture_;
+  flutter::TextureRegistrar*                           texture_registrar_;
+  flutter::MethodChannel<flutter::EncodableValue>*     channel_;
+  std::unique_ptr<CameraTexture>                       texture_;
 
-  ComPtr<IMFSourceReader> reader_;
+  // ── Capture engine + D3D11 ─────────────────────────────────────────────
+  ComPtr<IMFCaptureEngine>      capture_engine_;
+  ComPtr<IMFCapturePreviewSink> preview_sink_;
+  ComPtr<ID3D11Device>          dx11_device_;
+  ComPtr<IMFDXGIDeviceManager>  dxgi_device_manager_;
+  UINT                          dx_device_reset_token_ = 0;
+
+  // Negotiated media types (set in FindBaseMediaTypes before preview starts).
+  ComPtr<IMFMediaType> base_preview_media_type_;
+  ComPtr<IMFMediaType> base_capture_media_type_;
+  int preview_width_  = 0;
+  int preview_height_ = 0;
+  int record_width_   = 0;
+  int record_height_  = 0;
+  int record_fps_     = 0;
+
+  // ── Recording ──────────────────────────────────────────────────────────
   std::unique_ptr<RecordHandler> record_handler_;
+  std::wstring                   current_record_path_;
+  std::atomic<bool>              is_recording_{false};
+  int                            active_record_bitrate_ = 0;
 
-  // ── Capture thread ───────────────────────────────────────────────────────
-  std::thread        capture_thread_;
-  std::atomic<bool>  running_{false};
-  std::atomic<bool>  preview_paused_{false};
-  std::atomic<bool>  image_streaming_{false};
+  // ── Preview / frame state ───────────────────────────────────────────────
+  std::atomic<bool> first_frame_received_{false};
+  std::atomic<bool> preview_paused_{false};
+  std::atomic<bool> image_streaming_{false};
 
-  // ── Latest raw frame for photo capture (mirrored BGRA) ──────────────────
+  // ── Latest frame for photo capture (natural BGRA) ─────────────────────
   std::vector<uint8_t> latest_frame_;
   std::mutex           latest_frame_mutex_;
 
-  // ── Persistent per-frame pixel buffer (P7) ───────────────────────────────
+  // ── Per-frame working buffer ────────────────────────────────────────────
   std::vector<uint8_t> packed_frame_;
 
-  // ── Actual camera dimensions (written by capture thread) ─────────────────
-  int        actual_width_  = 0;
-  int        actual_height_ = 0;
-  mutable std::mutex dims_mutex_;
-
-  // ── Camera state (all accesses hold state_mutex_) ────────────────────────
+  // ── Camera state ────────────────────────────────────────────────────────
   CameraState        state_ = CameraState::kCreated;
   mutable std::mutex state_mutex_;
 
-  // ── Initialization result + timeout thread ───────────────────────────────
-  std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> pending_init_;
-  std::mutex   pending_init_mutex_;
+  // ── Pending async MethodResults ─────────────────────────────────────────
+  mutable std::mutex pending_mutex_;
+  std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+      pending_init_;
+  std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+      pending_start_record_;
+  std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+      pending_stop_record_;
 
-  std::atomic<bool>       first_frame_received_{false};
+  // ── Initialisation timeout ──────────────────────────────────────────────
   std::thread             init_timeout_thread_;
   std::mutex              init_timeout_cancel_mutex_;
   std::condition_variable init_timeout_cancel_cv_;
   bool                    init_timeout_cancelled_ = false;
 
-  // ── Image stream delivery ─────────────────────────────────────────────
+  // ── Image stream delivery ───────────────────────────────────────────────
   struct ImageStreamBuffer {
     int64_t  sequence;
     int32_t  width;
     int32_t  height;
     int32_t  bytes_per_row;
-    int32_t  format;       // 0=BGRA, 1=RGBA
-    int32_t  ready;        // 1=Dart may read, 0=native writing
+    int32_t  format;   // 0=BGRA, 1=RGBA
+    int32_t  ready;    // 1=Dart may read, 0=native writing
     int32_t  _pad;
-    uint8_t  pixels[1];    // flexible array member (MSVC-compatible)
+    uint8_t  pixels[1];
   };
 
-  // FFI shared buffer (replaces MethodChannel slot for FFI-enabled consumers).
-  ImageStreamBuffer* image_stream_buffer_ = nullptr;
-  size_t image_stream_buffer_size_ = 0;
-  void (*image_stream_callback_)(int32_t) = nullptr;
-  int64_t image_stream_sequence_ = 0;
-  std::mutex image_stream_ffi_mutex_;
+  ImageStreamBuffer* image_stream_buffer_      = nullptr;
+  size_t             image_stream_buffer_size_ = 0;
+  void (*image_stream_callback_)(int32_t)      = nullptr;
+  int64_t            image_stream_sequence_    = 0;
+  std::mutex         image_stream_ffi_mutex_;
 
-  // Legacy MethodChannel delivery (used when no FFI callback is registered).
   struct ImageStreamSlot {
     std::vector<uint8_t> data;
     int  width  = 0;
@@ -162,4 +193,14 @@ class Camera {
   ImageStreamSlot         image_stream_slot_;
   std::thread             image_stream_thread_;
   std::atomic<bool>       image_stream_running_{false};
+  std::thread             image_stream_join_thread_;
+  std::mutex              image_stream_thread_mutex_;
+
+  // ── Async dispose ───────────────────────────────────────────────────────
+  std::thread                         dispose_thread_;
+  std::mutex                          dispose_mutex_;
+  std::vector<std::function<void()>>  dispose_callbacks_;
 };
+
+
+

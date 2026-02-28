@@ -63,7 +63,7 @@ packages:
       path: ".."
       relative: true
     source: path
-    version: "0.0.5"
+    version: "0.0.8"
   camera_platform_interface:
     dependency: "direct main"
     description:

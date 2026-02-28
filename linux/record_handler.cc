@@ -79,7 +79,8 @@ std::string RecordHandler::DetectAudioEncoder() {
 }
 
 bool RecordHandler::Setup(GstElement* pipeline, GstElement* tee,
-                          int width, int height, int fps, bool enable_audio,
+                          int width, int height, int fps, int video_bitrate,
+                          int audio_bitrate, bool enable_audio,
                           GError** error) {
   if (is_setup_) return true;
 
@@ -134,10 +135,20 @@ bool RecordHandler::Setup(GstElement* pipeline, GstElement* tee,
 
   // Configure encoder settings based on type.
   if (encoder_name_ == "x264enc") {
+    int x264_kbps = 4000;
+    if (video_bitrate > 0) {
+      x264_kbps = video_bitrate / 1000;
+      if (x264_kbps <= 0) x264_kbps = 1;
+    }
     g_object_set(encoder_, "tune", 4 /* zerolatency */, "speed-preset", 2
-                 /* superfast */, "bitrate", 4000, nullptr);
+                 /* superfast */, "bitrate", x264_kbps, nullptr);
   } else if (encoder_name_ == "openh264enc") {
-    g_object_set(encoder_, "bitrate", 4000000, nullptr);
+    int openh264_bps = video_bitrate > 0 ? video_bitrate : 4000000;
+    g_object_set(encoder_, "bitrate", openh264_bps, nullptr);
+  } else if (encoder_name_ == "vah264enc" || encoder_name_ == "vaapih264enc") {
+    if (video_bitrate > 0) {
+      g_object_set(encoder_, "bitrate", video_bitrate / 1000, nullptr);
+    }
   }
 
   // Add all video elements to the pipeline.
@@ -176,7 +187,7 @@ bool RecordHandler::Setup(GstElement* pipeline, GstElement* tee,
   // Set up audio branch if requested.
   if (enable_audio) {
     GError* audio_error = nullptr;
-    if (SetupAudioBranch(&audio_error)) {
+    if (SetupAudioBranch(audio_bitrate, &audio_error)) {
       has_audio_ = true;
     } else {
       // Audio setup failed — log warning but continue without audio.
@@ -191,7 +202,7 @@ bool RecordHandler::Setup(GstElement* pipeline, GstElement* tee,
   return true;
 }
 
-bool RecordHandler::SetupAudioBranch(GError** error) {
+bool RecordHandler::SetupAudioBranch(int audio_bitrate, GError** error) {
   audio_encoder_name_ = DetectAudioEncoder();
   if (audio_encoder_name_.empty()) {
     g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED,
@@ -217,6 +228,10 @@ bool RecordHandler::SetupAudioBranch(GError** error) {
 
   // Start with audio valve closed.
   g_object_set(audio_valve_, "drop", TRUE, nullptr);
+
+  if (audio_bitrate > 0) {
+    g_object_set(audio_encoder_, "bitrate", audio_bitrate, nullptr);
+  }
 
   // Add audio elements to pipeline.
   gst_bin_add_many(GST_BIN(pipeline_), audio_source_, audio_queue_,
@@ -305,6 +320,9 @@ struct StopRecordingData {
   RecordHandler* handler;
   FlMethodCall* method_call;
   std::string output_path;
+  std::string container;
+  std::string video_codec;
+  std::string audio_codec;
 };
 
 GstPadProbeReturn RecordHandler::OnEosEvent(GstPad* pad,
@@ -321,8 +339,15 @@ GstPadProbeReturn RecordHandler::OnEosEvent(GstPad* pad,
       [](gpointer user_data) -> gboolean {
         StopRecordingData* data = static_cast<StopRecordingData*>(user_data);
 
-        g_autoptr(FlValue) result =
-            fl_value_new_string(data->output_path.c_str());
+        g_autoptr(FlValue) result = fl_value_new_map();
+        fl_value_set_string_take(result, "path",
+                                 fl_value_new_string(data->output_path.c_str()));
+        fl_value_set_string_take(result, "container",
+                                 fl_value_new_string(data->container.c_str()));
+        fl_value_set_string_take(result, "videoCodec",
+                                 fl_value_new_string(data->video_codec.c_str()));
+        fl_value_set_string_take(result, "audioCodec",
+                                 fl_value_new_string(data->audio_codec.c_str()));
         fl_method_call_respond_success(data->method_call, result, nullptr);
         g_object_unref(data->method_call);
 
@@ -351,6 +376,9 @@ void RecordHandler::StopRecording(FlMethodCall* method_call) {
   data->handler = this;
   data->method_call = FL_METHOD_CALL(g_object_ref(method_call));
   data->output_path = output_path_;
+  data->container = output_extension();
+  data->video_codec = encoder_name_;
+  data->audio_codec = has_audio_ ? audio_encoder_name_ : "";
 
   if (filesink_pad) {
     gst_pad_add_probe(filesink_pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
@@ -390,7 +418,15 @@ void RecordHandler::StopRecording(FlMethodCall* method_call) {
 
   // If we couldn't set up the probe, respond immediately.
   if (!filesink_pad) {
-    g_autoptr(FlValue) result = fl_value_new_string(output_path_.c_str());
+    g_autoptr(FlValue) result = fl_value_new_map();
+    fl_value_set_string_take(result, "path",
+                             fl_value_new_string(data->output_path.c_str()));
+    fl_value_set_string_take(result, "container",
+                             fl_value_new_string(data->container.c_str()));
+    fl_value_set_string_take(result, "videoCodec",
+                             fl_value_new_string(data->video_codec.c_str()));
+    fl_value_set_string_take(result, "audioCodec",
+                             fl_value_new_string(data->audio_codec.c_str()));
     fl_method_call_respond_success(method_call, result, nullptr);
     g_object_unref(data->method_call);
     delete data;

@@ -7,12 +7,6 @@ import AVFoundation
 /// Speaks the exact same protocol as the Linux native side so the shared
 /// Dart CameraDesktopPlugin class works on both platforms.
 public class CameraDesktopPlugin: NSObject, FlutterPlugin {
-    private static var _sharedInstance: CameraDesktopPlugin?
-    @objc public class var sharedInstance: CameraDesktopPlugin? {
-        get { _sharedInstance }
-        set { _sharedInstance = newValue }
-    }
-
     private var sessions: [Int: CameraSession] = [:]
     private let sessionsLock = UnfairLock()
     private var nextCameraId = 1
@@ -35,13 +29,14 @@ public class CameraDesktopPlugin: NSObject, FlutterPlugin {
             methodChannel: channel
         )
         registrar.addMethodCallDelegate(instance, channel: channel)
-        CameraDesktopPlugin.sharedInstance = instance
     }
 
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
         case "availableCameras":
             handleAvailableCameras(result: result)
+        case "getPlatformCapabilities":
+            handleGetPlatformCapabilities(result: result)
         case "create":
             handleCreate(call: call, result: result)
         case "initialize":
@@ -71,6 +66,14 @@ public class CameraDesktopPlugin: NSObject, FlutterPlugin {
 
     // MARK: - Method Handlers
 
+    private func handleGetPlatformCapabilities(result: @escaping FlutterResult) {
+        result([
+            "supportsMirrorControl": true,
+            "supportsVideoFpsControl": true,
+            "supportsVideoBitrateControl": true,
+        ])
+    }
+
     private func handleAvailableCameras(result: @escaping FlutterResult) {
         DispatchQueue.global(qos: .userInitiated).async {
             let devices = DeviceEnumerator.enumerateDevices()
@@ -98,6 +101,30 @@ public class CameraDesktopPlugin: NSObject, FlutterPlugin {
         }
 
         let enableAudio = args["enableAudio"] as? Bool ?? false
+        var targetFps = 30
+        if let fps = args["fps"] as? Int {
+            targetFps = fps
+        } else if let fps = args["fps"] as? Double {
+            targetFps = Int(fps)
+        }
+        if targetFps < 5 { targetFps = 5 }
+        if targetFps > 60 { targetFps = 60 }
+
+        var targetBitrate = 0
+        if let bitrate = args["videoBitrate"] as? Int {
+            targetBitrate = bitrate
+        } else if let bitrate = args["videoBitrate"] as? Double {
+            targetBitrate = Int(bitrate)
+        }
+        if targetBitrate < 0 { targetBitrate = 0 }
+
+        var targetAudioBitrate = 0
+        if let bitrate = args["audioBitrate"] as? Int {
+            targetAudioBitrate = bitrate
+        } else if let bitrate = args["audioBitrate"] as? Double {
+            targetAudioBitrate = Int(bitrate)
+        }
+        if targetAudioBitrate < 0 { targetAudioBitrate = 0 }
 
         // Extract device ID from camera name: "Friendly Name (deviceId)"
         guard let deviceId = DeviceEnumerator.extractDeviceId(from: cameraName) else {
@@ -113,7 +140,10 @@ public class CameraDesktopPlugin: NSObject, FlutterPlugin {
         let config = CameraSession.CameraConfig(
             deviceId: deviceId,
             resolutionPreset: resolutionPreset,
-            enableAudio: enableAudio
+            enableAudio: enableAudio,
+            targetFps: targetFps,
+            targetBitrate: targetBitrate,
+            audioBitrate: targetAudioBitrate
         )
 
         let session = CameraSession(
@@ -164,11 +194,19 @@ public class CameraDesktopPlugin: NSObject, FlutterPlugin {
     private func handleStartImageStream(call: FlutterMethodCall, result: @escaping FlutterResult) {
         guard let session = findSession(call: call, result: result) else { return }
         session.startImageStream()
-        result(nil)
+        let streamHandle = ImageStreamHandleBridge.registerSession(session)
+        result(["streamHandle": streamHandle])
     }
 
     private func handleStopImageStream(call: FlutterMethodCall, result: @escaping FlutterResult) {
         guard let session = findSession(call: call, result: result) else { return }
+        if let args = call.arguments as? [String: Any] {
+            if let streamHandle = args["streamHandle"] as? Int64 {
+                ImageStreamHandleBridge.releaseHandle(streamHandle)
+            } else if let streamHandleInt = args["streamHandle"] as? Int {
+                ImageStreamHandleBridge.releaseHandle(Int64(streamHandleInt))
+            }
+        }
         session.stopImageStream()
         result(nil)
     }
@@ -209,34 +247,9 @@ public class CameraDesktopPlugin: NSObject, FlutterPlugin {
         let session = sessions.removeValue(forKey: cameraId)
         sessionsLock.unlock()
 
+        ImageStreamHandleBridge.releaseHandles(forCameraId: cameraId)
         session?.dispose()
         result(nil)
-    }
-
-    // MARK: - FFI Bridge
-
-    @objc public func getImageStreamBuffer(forCamera cameraId: Int) -> UnsafeMutableRawPointer? {
-        sessionsLock.lock()
-        let session = sessions[cameraId]
-        sessionsLock.unlock()
-        return session?.getImageStreamBufferPointer()
-    }
-
-    @objc public func registerImageStreamCallback(
-        _ callback: @convention(c) (Int32) -> Void,
-        forCamera cameraId: Int
-    ) {
-        sessionsLock.lock()
-        let session = sessions[cameraId]
-        sessionsLock.unlock()
-        session?.registerImageStreamCallback(callback)
-    }
-
-    @objc public func unregisterImageStreamCallback(forCamera cameraId: Int) {
-        sessionsLock.lock()
-        let session = sessions[cameraId]
-        sessionsLock.unlock()
-        session?.unregisterImageStreamCallback()
     }
 
     // MARK: - Helpers

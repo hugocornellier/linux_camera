@@ -5,6 +5,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 
 #include "camera.h"
 
@@ -18,8 +19,7 @@ class CameraDesktopPlugin : public flutter::Plugin {
 
   ~CameraDesktopPlugin() override;
 
-  // FFI camera lookup (called from image_stream_ffi.cpp).
-  Camera* FindCameraById(int camera_id);
+  void EraseCameraAfterDispose(int camera_id);
 
   // Global instance for FFI access.
   static CameraDesktopPlugin* instance() { return instance_; }
@@ -31,6 +31,8 @@ class CameraDesktopPlugin : public flutter::Plugin {
 
   // Helpers for individual methods.
   void HandleAvailableCameras(
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+  void HandleGetPlatformCapabilities(
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
   void HandleCreate(
       const flutter::EncodableMap& args,
@@ -59,19 +61,25 @@ class CameraDesktopPlugin : public flutter::Plugin {
   void HandleResumePreview(
       const flutter::EncodableMap& args,
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+  void HandleSetMirror(
+      const flutter::EncodableMap& args,
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
   void HandleDispose(
       const flutter::EncodableMap& args,
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
 
   // Returns the camera for |args["cameraId"]| or responds with an error.
-  Camera* FindCamera(
+  std::shared_ptr<Camera> FindCamera(
       const flutter::EncodableMap& args,
       flutter::MethodResult<flutter::EncodableValue>* result);
 
   flutter::PluginRegistrarWindows* registrar_;
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> channel_;
-  std::map<int, std::unique_ptr<Camera>> cameras_;
+  mutable std::mutex cameras_mutex_;
+  std::map<int, std::shared_ptr<Camera>> cameras_;
   int next_camera_id_ = 1;
+  bool should_co_uninitialize_ = false;
+  bool shutting_down_ = false;
 
   static CameraDesktopPlugin* instance_;
 };

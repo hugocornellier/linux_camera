@@ -39,7 +39,7 @@ void main() {
               case 'startVideoRecording':
                 return null;
               case 'stopVideoRecording':
-                return '/tmp/test_video.mp4';
+                return {'path': '/tmp/test_video.mp4', 'framesDropped': 0};
               case 'startImageStream':
               case 'stopImageStream':
               case 'dispose':

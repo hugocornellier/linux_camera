@@ -30,6 +30,23 @@ class CameraExampleApp extends StatelessWidget {
 
 enum CaptureMode { photo, video }
 
+const List<int> kFpsOptions = [15, 24, 30, 60];
+
+const List<({int value, String label})> kVideoBitrateOptions = [
+  (value: 1000000, label: '1 Mbps'),
+  (value: 2500000, label: '2.5 Mbps'),
+  (value: 5000000, label: '5 Mbps'),
+  (value: 10000000, label: '10 Mbps'),
+  (value: 20000000, label: '20 Mbps'),
+];
+
+const List<({int value, String label})> kAudioBitrateOptions = [
+  (value: 64000, label: '64 kbps'),
+  (value: 128000, label: '128 kbps'),
+  (value: 192000, label: '192 kbps'),
+  (value: 256000, label: '256 kbps'),
+];
+
 class CameraExamplePage extends StatefulWidget {
   const CameraExamplePage({super.key});
 
@@ -46,8 +63,21 @@ class _CameraExamplePageState extends State<CameraExamplePage> {
 
   CaptureMode _mode = CaptureMode.photo;
   bool _isRecording = false;
+  bool _isStoppingRecording = false;
   Duration _recordingDuration = Duration.zero;
   Timer? _recordingTimer;
+  int _nextPendingVideoId = 1;
+  final List<_PendingVideo> _pendingVideos = <_PendingVideo>[];
+
+  // Settings state — these drive the CameraController constructor.
+  int _selectedCameraIndex = 0;
+  ResolutionPreset _resolutionPreset = ResolutionPreset.veryHigh;
+  int _fps = 30;
+  int _videoBitrate = 5000000;
+  int _audioBitrate = 128000;
+  bool _enableAudio = true;
+  bool _showSettings = false;
+  bool _isReinitializing = false;
 
   final RecentMediaStore _mediaStore = RecentMediaStore();
 
@@ -64,25 +94,60 @@ class _CameraExamplePageState extends State<CameraExamplePage> {
         setState(() => _errorMessage = 'No cameras found');
         return;
       }
-
-      final controller = CameraController(
-        _cameras.first,
-        ResolutionPreset.high,
-        enableAudio: true,
-      );
-
-      await controller.initialize();
-      if (!mounted) return;
-
-      setState(() {
-        _controller = controller;
-        _isInitialized = true;
-        _errorMessage = null;
-      });
+      await _createAndInitController();
     } on CameraException catch (e) {
       setState(() => _errorMessage = 'Camera error: ${e.description}');
     } catch (e) {
       setState(() => _errorMessage = 'Error: $e');
+    }
+  }
+
+  Future<void> _createAndInitController() async {
+    final controller = CameraController(
+      _cameras[_selectedCameraIndex],
+      _resolutionPreset,
+      enableAudio: _enableAudio,
+      fps: _fps,
+      videoBitrate: _videoBitrate,
+      audioBitrate: _audioBitrate,
+    );
+
+    await controller.initialize();
+    if (!mounted) return;
+
+    setState(() {
+      _controller = controller;
+      _isInitialized = true;
+      _isReinitializing = false;
+      _errorMessage = null;
+    });
+  }
+
+  Future<void> _reinitCamera() async {
+    if (_isRecording || _isStoppingRecording) return;
+
+    setState(() {
+      _isReinitializing = true;
+      _isInitialized = false;
+    });
+
+    await _controller?.dispose();
+    _controller = null;
+
+    try {
+      await _createAndInitController();
+    } on CameraException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isReinitializing = false;
+        _errorMessage = 'Camera error: ${e.description}';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isReinitializing = false;
+        _errorMessage = 'Error: $e';
+      });
     }
   }
 
@@ -127,19 +192,45 @@ class _CameraExamplePageState extends State<CameraExamplePage> {
   }
 
   Future<void> _stopRecording() async {
-    if (!_isRecording) return;
+    if (!_isRecording || _isStoppingRecording || _controller == null) return;
     _recordingTimer?.cancel();
+    final pendingId = _nextPendingVideoId++;
+    setState(() {
+      _isRecording = false;
+      _isStoppingRecording = true;
+      _pendingVideos.insert(0, _PendingVideo(id: pendingId));
+    });
+
+    unawaited(_finalizeVideoStop(pendingId));
+  }
+
+  Future<void> _finalizeVideoStop(int pendingId) async {
     try {
       final file = await _controller!.stopVideoRecording();
       if (!mounted) return;
       _mediaStore.add(file.path, MediaType.video);
-      setState(() => _isRecording = false);
+      setState(() {
+        _isStoppingRecording = false;
+        _pendingVideos.removeWhere((p) => p.id == pendingId);
+      });
     } on CameraException catch (e) {
       if (!mounted) return;
-      setState(() => _isRecording = false);
+      setState(() {
+        _isStoppingRecording = false;
+        _pendingVideos.removeWhere((p) => p.id == pendingId);
+      });
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Stop recording failed: ${e.description}')),
       );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isStoppingRecording = false;
+        _pendingVideos.removeWhere((p) => p.id == pendingId);
+      });
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Stop recording failed: $e')));
     }
   }
 
@@ -164,13 +255,23 @@ class _CameraExamplePageState extends State<CameraExamplePage> {
         title: const Text('Camera Desktop Example'),
         actions: [
           IconButton(
+            icon: Icon(
+              _showSettings ? Icons.settings : Icons.settings_outlined,
+            ),
+            tooltip: 'Settings',
+            onPressed: _isRecording
+                ? null
+                : () => setState(() => _showSettings = !_showSettings),
+          ),
+          IconButton(
             icon: Badge(
-              label: Text('${_mediaStore.count}'),
-              isLabelVisible: _mediaStore.isNotEmpty,
+              label: Text('${_mediaStore.count + _pendingVideos.length}'),
+              isLabelVisible:
+                  _mediaStore.isNotEmpty || _pendingVideos.isNotEmpty,
               child: const Icon(Icons.photo_library),
             ),
             tooltip:
-                'Gallery (${_mediaStore.count}/${RecentMediaStore.maxItems})',
+                'Gallery (${_mediaStore.count + _pendingVideos.length}/${RecentMediaStore.maxItems})',
             onPressed: () => Navigator.push(
               context,
               MaterialPageRoute(
@@ -183,8 +284,10 @@ class _CameraExamplePageState extends State<CameraExamplePage> {
       body: Column(
         children: [
           Expanded(child: _buildPreview()),
+          if (_showSettings && _isInitialized) _buildSettingsPanel(),
           if (_isInitialized) _buildControlBar(),
-          if (_mediaStore.isNotEmpty) _buildThumbnailStrip(),
+          if (_mediaStore.isNotEmpty || _pendingVideos.isNotEmpty)
+            _buildThumbnailStrip(),
           if (_errorMessage != null && !_isInitialized)
             Padding(
               padding: const EdgeInsets.all(8.0),
@@ -199,7 +302,7 @@ class _CameraExamplePageState extends State<CameraExamplePage> {
   }
 
   Widget _buildPreview() {
-    if (_errorMessage != null && !_isInitialized) {
+    if (_errorMessage != null && !_isInitialized && !_isReinitializing) {
       return Center(child: Text(_errorMessage!));
     }
     if (!_isInitialized || _controller == null) {
@@ -245,6 +348,161 @@ class _CameraExamplePageState extends State<CameraExamplePage> {
               ),
             ),
           ),
+      ],
+    );
+  }
+
+  String _resolutionLabel(ResolutionPreset preset) {
+    return switch (preset) {
+      ResolutionPreset.low => 'Low (240p)',
+      ResolutionPreset.medium => 'Medium (480p)',
+      ResolutionPreset.high => 'High (720p)',
+      ResolutionPreset.veryHigh => 'Very High (1080p)',
+      ResolutionPreset.ultraHigh => 'Ultra High (4K)',
+      ResolutionPreset.max => 'Max',
+    };
+  }
+
+  Widget _buildSettingsPanel() {
+    final theme = Theme.of(context);
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest,
+        border: Border(
+          top: BorderSide(color: theme.colorScheme.outlineVariant),
+        ),
+      ),
+      child: Wrap(
+        spacing: 24,
+        runSpacing: 12,
+        children: [
+          if (_cameras.length > 1)
+            _buildDropdownSetting<int>(
+              label: 'Camera',
+              value: _selectedCameraIndex,
+              items: [
+                for (var i = 0; i < _cameras.length; i++)
+                  DropdownMenuItem(value: i, child: Text(_cameras[i].name)),
+              ],
+              onChanged: (v) {
+                if (v == null || v == _selectedCameraIndex) return;
+                setState(() => _selectedCameraIndex = v);
+                _reinitCamera();
+              },
+            ),
+          _buildDropdownSetting<ResolutionPreset>(
+            label: 'Resolution',
+            value: _resolutionPreset,
+            items: ResolutionPreset.values
+                .map(
+                  (p) => DropdownMenuItem(
+                    value: p,
+                    child: Text(_resolutionLabel(p)),
+                  ),
+                )
+                .toList(),
+            onChanged: (v) {
+              if (v == null || v == _resolutionPreset) return;
+              setState(() => _resolutionPreset = v);
+              _reinitCamera();
+            },
+          ),
+          _buildDropdownSetting<int>(
+            label: 'FPS',
+            value: _fps,
+            items: kFpsOptions
+                .map((f) => DropdownMenuItem(value: f, child: Text('$f fps')))
+                .toList(),
+            onChanged: (v) {
+              if (v == null || v == _fps) return;
+              setState(() => _fps = v);
+              _reinitCamera();
+            },
+          ),
+          _buildDropdownSetting<int>(
+            label: 'Video Bitrate',
+            value: _videoBitrate,
+            items: kVideoBitrateOptions
+                .map(
+                  (o) => DropdownMenuItem(value: o.value, child: Text(o.label)),
+                )
+                .toList(),
+            onChanged: (v) {
+              if (v == null || v == _videoBitrate) return;
+              setState(() => _videoBitrate = v);
+              _reinitCamera();
+            },
+          ),
+          _buildDropdownSetting<int>(
+            label: 'Audio Bitrate',
+            value: _audioBitrate,
+            items: kAudioBitrateOptions
+                .map(
+                  (o) => DropdownMenuItem(value: o.value, child: Text(o.label)),
+                )
+                .toList(),
+            onChanged: (v) {
+              if (v == null || v == _audioBitrate) return;
+              setState(() => _audioBitrate = v);
+              _reinitCamera();
+            },
+          ),
+          _buildSwitchSetting(
+            label: 'Audio',
+            value: _enableAudio,
+            onChanged: (v) {
+              setState(() => _enableAudio = v);
+              _reinitCamera();
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDropdownSetting<T>({
+    required String label,
+    required T value,
+    required List<DropdownMenuItem<T>> items,
+    required ValueChanged<T?> onChanged,
+  }) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          '$label: ',
+          style: Theme.of(
+            context,
+          ).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w500),
+        ),
+        DropdownButton<T>(
+          value: value,
+          items: items,
+          onChanged: _isReinitializing ? null : onChanged,
+          underline: const SizedBox.shrink(),
+          isDense: true,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildSwitchSetting({
+    required String label,
+    required bool value,
+    required ValueChanged<bool> onChanged,
+  }) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          '$label: ',
+          style: Theme.of(
+            context,
+          ).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w500),
+        ),
+        Switch(value: value, onChanged: _isReinitializing ? null : onChanged),
       ],
     );
   }
@@ -305,33 +563,56 @@ class _CameraExamplePageState extends State<CameraExamplePage> {
     }
 
     return FloatingActionButton(
-      onPressed: _startRecording,
+      onPressed: _isStoppingRecording ? null : _startRecording,
       backgroundColor: Colors.red,
       foregroundColor: Colors.white,
-      child: const Icon(Icons.fiber_manual_record),
+      child: _isStoppingRecording
+          ? const SizedBox(
+              width: 24,
+              height: 24,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: Colors.white,
+              ),
+            )
+          : const Icon(Icons.fiber_manual_record),
     );
   }
 
   Widget _buildThumbnailStrip() {
     final items = _mediaStore.items;
+    final pendingCount = _pendingVideos.length;
     return SizedBox(
       height: 72,
       child: ListView.builder(
         scrollDirection: Axis.horizontal,
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-        itemCount: items.length,
+        itemCount: pendingCount + items.length,
         itemBuilder: (context, index) {
-          final item = items[index];
+          final isPending = index < pendingCount;
+          final item = isPending ? null : items[index - pendingCount];
           return Padding(
             padding: const EdgeInsets.symmetric(horizontal: 4),
             child: GestureDetector(
-              onTap: () => _onThumbnailTap(item, index),
+              onTap: () {
+                if (isPending) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Video is still processing. Please wait.'),
+                    ),
+                  );
+                } else {
+                  _onThumbnailTap(item!, index - pendingCount);
+                }
+              },
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(8),
                 child: SizedBox(
                   width: 64,
                   height: 64,
-                  child: item.isVideo
+                  child: isPending
+                      ? _buildPendingVideoThumbnail()
+                      : item!.isVideo
                       ? _buildVideoThumbnail()
                       : _buildPhotoThumbnail(item),
                 ),
@@ -373,6 +654,38 @@ class _CameraExamplePageState extends State<CameraExamplePage> {
     );
   }
 
+  Widget _buildPendingVideoThumbnail() {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        Container(color: Colors.grey.shade700),
+        const Center(
+          child: SizedBox(
+            width: 22,
+            height: 22,
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              color: Colors.white,
+            ),
+          ),
+        ),
+        Align(
+          alignment: Alignment.bottomCenter,
+          child: Container(
+            color: Colors.black54,
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(vertical: 2),
+            child: const Text(
+              'Processing',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.white, fontSize: 9),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _buildPhotoThumbnail(MediaEntry item) {
     return Image.file(
       File(item.path),
@@ -388,4 +701,10 @@ class _CameraExamplePageState extends State<CameraExamplePage> {
       ),
     );
   }
+}
+
+class _PendingVideo {
+  final int id;
+
+  _PendingVideo({required this.id});
 }

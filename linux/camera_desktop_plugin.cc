@@ -3,15 +3,18 @@
 #include <flutter_linux/flutter_linux.h>
 #include <gst/gst.h>
 
-// FFI bridge — defined in image_stream_ffi.cc.
-extern "C" void camera_desktop_ffi_set_plugin(void* plugin);
 
 #include <map>
 #include <memory>
 #include <string>
+#include <cstdint>
 
 #include "camera.h"
 #include "device_enumerator.h"
+
+int64_t camera_desktop_ffi_register_stream_handle(Camera* camera);
+void camera_desktop_ffi_release_stream_handle(int64_t stream_handle);
+void camera_desktop_ffi_release_handles_for_camera(Camera* camera);
 
 // Plugin data stored as an opaque C++ pointer inside the GObject struct.
 struct PluginData {
@@ -61,6 +64,17 @@ static void handle_available_cameras(CameraDesktopPlugin* self,
   fl_method_call_respond_success(method_call, result, nullptr);
 }
 
+static void handle_get_platform_capabilities(FlMethodCall* method_call) {
+  g_autoptr(FlValue) result = fl_value_new_map();
+  fl_value_set_string_take(result, "supportsMirrorControl",
+                           fl_value_new_bool(true));
+  fl_value_set_string_take(result, "supportsVideoFpsControl",
+                           fl_value_new_bool(true));
+  fl_value_set_string_take(result, "supportsVideoBitrateControl",
+                           fl_value_new_bool(true));
+  fl_method_call_respond_success(method_call, result, nullptr);
+}
+
 static void handle_create(CameraDesktopPlugin* self,
                           FlMethodCall* method_call) {
   FlValue* args = fl_method_call_get_args(method_call);
@@ -70,6 +84,37 @@ static void handle_create(CameraDesktopPlugin* self,
       fl_value_get_int(fl_value_lookup_string(args, "resolutionPreset"));
   FlValue* audio_val = fl_value_lookup_string(args, "enableAudio");
   bool enable_audio = audio_val ? fl_value_get_bool(audio_val) : false;
+
+  int target_fps = 30;
+  FlValue* fps_val = fl_value_lookup_string(args, "fps");
+  if (fps_val && fl_value_get_type(fps_val) == FL_VALUE_TYPE_INT) {
+    target_fps = fl_value_get_int(fps_val);
+  } else if (fps_val && fl_value_get_type(fps_val) == FL_VALUE_TYPE_FLOAT) {
+    target_fps = static_cast<int>(fl_value_get_float(fps_val));
+  }
+  if (target_fps < 5) target_fps = 5;
+  if (target_fps > 60) target_fps = 60;
+
+  int target_bitrate = 0;
+  FlValue* bitrate_val = fl_value_lookup_string(args, "videoBitrate");
+  if (bitrate_val && fl_value_get_type(bitrate_val) == FL_VALUE_TYPE_INT) {
+    target_bitrate = fl_value_get_int(bitrate_val);
+  } else if (bitrate_val &&
+             fl_value_get_type(bitrate_val) == FL_VALUE_TYPE_FLOAT) {
+    target_bitrate = static_cast<int>(fl_value_get_float(bitrate_val));
+  }
+  if (target_bitrate < 0) target_bitrate = 0;
+
+  int audio_bitrate = 0;
+  FlValue* audio_bitrate_val = fl_value_lookup_string(args, "audioBitrate");
+  if (audio_bitrate_val &&
+      fl_value_get_type(audio_bitrate_val) == FL_VALUE_TYPE_INT) {
+    audio_bitrate = fl_value_get_int(audio_bitrate_val);
+  } else if (audio_bitrate_val &&
+             fl_value_get_type(audio_bitrate_val) == FL_VALUE_TYPE_FLOAT) {
+    audio_bitrate = static_cast<int>(fl_value_get_float(audio_bitrate_val));
+  }
+  if (audio_bitrate < 0) audio_bitrate = 0;
 
   // Extract device path from the camera name.
   // Format: "Friendly Name (/dev/videoN)" — extract the path in parentheses.
@@ -104,7 +149,9 @@ static void handle_create(CameraDesktopPlugin* self,
   config.enable_audio = enable_audio;
   config.target_width = selected.width;
   config.target_height = selected.height;
-  config.target_fps = selected.max_fps;
+  config.target_fps = target_fps > 0 ? target_fps : selected.max_fps;
+  config.target_bitrate = target_bitrate;
+  config.audio_bitrate = audio_bitrate;
 
   int camera_id = self->data->next_camera_id++;
   auto camera = std::make_unique<Camera>(
@@ -144,15 +191,6 @@ static Camera* find_camera(CameraDesktopPlugin* self,
   return it->second.get();
 }
 
-// Exported for FFI bridge (image_stream_ffi.cc).
-extern "C" Camera* camera_desktop_find_camera_by_id(
-    CameraDesktopPlugin* plugin, int camera_id) {
-  if (!plugin || !plugin->data) return nullptr;
-  auto it = plugin->data->cameras.find(camera_id);
-  if (it == plugin->data->cameras.end()) return nullptr;
-  return it->second.get();
-}
-
 static void handle_initialize(CameraDesktopPlugin* self,
                               FlMethodCall* method_call) {
   Camera* camera = find_camera(self, method_call);
@@ -187,13 +225,22 @@ static void handle_start_image_stream(CameraDesktopPlugin* self,
   Camera* camera = find_camera(self, method_call);
   if (!camera) return;
   camera->StartImageStream();
-  fl_method_call_respond_success(method_call, fl_value_new_null(), nullptr);
+  const int64_t stream_handle = camera_desktop_ffi_register_stream_handle(camera);
+  g_autoptr(FlValue) result = fl_value_new_map();
+  fl_value_set_string_take(result, "streamHandle",
+                           fl_value_new_int(stream_handle));
+  fl_method_call_respond_success(method_call, result, nullptr);
 }
 
 static void handle_stop_image_stream(CameraDesktopPlugin* self,
                                      FlMethodCall* method_call) {
   Camera* camera = find_camera(self, method_call);
   if (!camera) return;
+  FlValue* args = fl_method_call_get_args(method_call);
+  FlValue* handle_val = fl_value_lookup_string(args, "streamHandle");
+  if (handle_val && fl_value_get_type(handle_val) == FL_VALUE_TYPE_INT) {
+    camera_desktop_ffi_release_stream_handle(fl_value_get_int(handle_val));
+  }
   camera->StopImageStream();
   fl_method_call_respond_success(method_call, fl_value_new_null(), nullptr);
 }
@@ -234,6 +281,7 @@ static void handle_dispose(CameraDesktopPlugin* self,
 
   auto it = self->data->cameras.find(camera_id);
   if (it != self->data->cameras.end()) {
+    camera_desktop_ffi_release_handles_for_camera(it->second.get());
     it->second->Dispose();
     self->data->cameras.erase(it);
   }
@@ -249,6 +297,8 @@ static void camera_desktop_plugin_handle_method_call(
 
   if (strcmp(method, "availableCameras") == 0) {
     handle_available_cameras(self, method_call);
+  } else if (strcmp(method, "getPlatformCapabilities") == 0) {
+    handle_get_platform_capabilities(method_call);
   } else if (strcmp(method, "create") == 0) {
     handle_create(self, method_call);
   } else if (strcmp(method, "initialize") == 0) {
@@ -289,6 +339,7 @@ static void camera_desktop_plugin_dispose(GObject* object) {
   // Dispose all cameras.
   if (self->data) {
     for (auto& pair : self->data->cameras) {
+      camera_desktop_ffi_release_handles_for_camera(pair.second.get());
       pair.second->Dispose();
     }
     delete self->data;
@@ -325,9 +376,6 @@ void camera_desktop_plugin_register_with_registrar(
       "plugins.flutter.io/camera_desktop", FL_METHOD_CODEC(codec));
   fl_method_channel_set_method_call_handler(
       plugin->channel, method_call_cb, g_object_ref(plugin), g_object_unref);
-
-  // Set the global plugin instance for FFI access.
-  camera_desktop_ffi_set_plugin(plugin);
 
   g_object_unref(plugin);
 }

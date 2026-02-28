@@ -39,4 +39,6 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
   strmiids
   uuid
   windowscodecs
+  d3d11
+  dxgi
 )

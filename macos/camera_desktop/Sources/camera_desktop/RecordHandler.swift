@@ -15,10 +15,17 @@ class RecordHandler: NSObject {
     /// - Parameters:
     ///   - width: Video frame width.
     ///   - height: Video frame height.
+    ///   - targetFps: Target frame rate for encoder hints.
+    ///   - targetBitrate: Target average bitrate in bits per second (0 = default).
     ///   - enableAudio: Whether to record audio.
     /// - Returns: The output file path on success.
     /// - Throws: If the asset writer cannot be created.
-    func startRecording(width: Int, height: Int, enableAudio: Bool) throws -> String {
+    func startRecording(width: Int,
+                        height: Int,
+                        targetFps: Int,
+                        targetBitrate: Int,
+                        audioBitrate: Int = 0,
+                        enableAudio: Bool) throws -> String {
         lock.lock()
         if isRecording {
             lock.unlock()
@@ -36,10 +43,19 @@ class RecordHandler: NSObject {
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
 
         // Video input — H.264 encoding.
+        var compression: [String: Any] = [
+            AVVideoExpectedSourceFrameRateKey: targetFps,
+            AVVideoMaxKeyFrameIntervalKey: max(targetFps, 1),
+        ]
+        if targetBitrate > 0 {
+            compression[AVVideoAverageBitRateKey] = targetBitrate
+        }
+
         let videoSettings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.h264,
             AVVideoWidthKey: width,
             AVVideoHeightKey: height,
+            AVVideoCompressionPropertiesKey: compression,
         ]
         let vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
         vInput.expectsMediaDataInRealTime = true
@@ -54,7 +70,7 @@ class RecordHandler: NSObject {
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
                 AVSampleRateKey: 44100,
                 AVNumberOfChannelsKey: 2,
-                AVEncoderBitRateKey: 128000,
+                AVEncoderBitRateKey: audioBitrate > 0 ? audioBitrate : 128000,
             ]
             aInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
             aInput!.expectsMediaDataInRealTime = true

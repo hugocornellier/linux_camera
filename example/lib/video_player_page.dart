@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
@@ -68,7 +70,16 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
         child: Column(
           children: [
             Expanded(
-              child: Video(controller: _videoController, fit: BoxFit.contain),
+              child: Platform.isWindows
+                  ? Transform(
+                      alignment: Alignment.center,
+                      transform: Matrix4.diagonal3Values(-1, 1, 1),
+                      child: Video(
+                        controller: _videoController,
+                        fit: BoxFit.contain,
+                      ),
+                    )
+                  : Video(controller: _videoController, fit: BoxFit.contain),
             ),
             _buildControls(),
           ],

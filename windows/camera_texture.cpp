@@ -21,24 +21,33 @@ int64_t CameraTexture::Register() {
 
 void CameraTexture::Update(const uint8_t* bgra, int width, int height) {
   const size_t required = static_cast<size_t>(width) * height * 4;
+  uint8_t* dst = nullptr;
+  int write_idx_snapshot = 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
 
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  // Reallocate all three buffers when dimensions change.
-  if (width != width_ || height != height_) {
-    for (auto& buf : bufs_) {
-      buf.resize(required);
+    // Reallocate all three buffers when dimensions change.
+    if (width != width_ || height != height_) {
+      for (auto& buf : bufs_) {
+        buf.resize(required);
+      }
+      width_ = width;
+      height_ = height;
     }
-    width_ = width;
-    height_ = height;
+    write_idx_snapshot = write_idx_;
+    dst = bufs_[write_idx_snapshot].data();
   }
 
-  // Copy into write buffer.
-  std::memcpy(bufs_[write_idx_].data(), bgra, required);
+  // Keep memcpy outside the mutex to minimize render-thread contention.
+  std::memcpy(dst, bgra, required);
 
-  // Swap write ↔ ready (capture thread owns both until this swap).
-  std::swap(write_idx_, ready_idx_);
-  has_new_frame_ = true;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (write_idx_ == write_idx_snapshot) {
+      std::swap(write_idx_, ready_idx_);
+      has_new_frame_ = true;
+    }
+  }
 }
 
 const FlutterDesktopPixelBuffer* CameraTexture::ObtainPixelBuffer(

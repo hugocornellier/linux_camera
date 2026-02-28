@@ -12,6 +12,8 @@ import 'image_stream_ffi.dart';
 /// Desktop implementation of [CameraPlatform].
 ///
 /// On Linux, uses GStreamer + V4L2. On macOS, uses AVFoundation.
+/// On Windows, uses Media Foundation (IMFCaptureEngine).
+///
 /// This plugin registers itself as the camera platform implementation for
 /// desktop. When an app depends on both `camera` and `camera_desktop`, Flutter
 /// automatically calls [registerWith], making [CameraController] work out of
@@ -31,13 +33,39 @@ class CameraDesktopPlugin extends CameraPlatform {
     CameraPlatform.instance = CameraDesktopPlugin();
   }
 
+  /// The method channel used to communicate with the native platform.
   final MethodChannel _channel;
+
+  /// Returns desktop backend capabilities for feature-gating advanced controls.
+  ///
+  /// Keys are stable capability names (e.g. `supportsMirrorControl`).
+  /// If the native side does not implement this method yet, returns an empty map.
+  Future<Map<String, bool>> getPlatformCapabilities() async {
+    try {
+      final raw = await _channel.invokeMapMethod<String, dynamic>(
+        'getPlatformCapabilities',
+      );
+      if (raw == null) return const <String, bool>{};
+      final out = <String, bool>{};
+      raw.forEach((key, value) {
+        if (value is bool) {
+          out[key] = value;
+        }
+      });
+      return out;
+    } on MissingPluginException {
+      return const <String, bool>{};
+    } on PlatformException {
+      return const <String, bool>{};
+    }
+  }
 
   /// Whether to mirror the preview horizontally (like a mirror).
   /// Defaults to `true`. Set to `false` to show the unmirrored camera image.
   @Deprecated('Mirroring is now handled at the native capture level.')
   final bool mirrorPreview;
 
+  /// Whether the native → Dart method-call handler has been installed.
   bool _nativeCallHandlerSet = false;
 
   /// Lazily installs the native → Dart method-call handler.
@@ -59,11 +87,19 @@ class CameraDesktopPlugin extends CameraPlatform {
   final StreamController<CameraEvent> _eventStreamController =
       StreamController<CameraEvent>.broadcast();
 
-  /// Per-camera image stream controllers for onStreamedFrameAvailable.
+  /// Per-camera image stream controllers for [onStreamedFrameAvailable].
+  ///
+  /// Only populated when [ImageStreamFfi] is unavailable and the fallback
+  /// MethodChannel path is used for frame delivery. When FFI is active,
+  /// frames bypass this map entirely and `_handleNativeCall`'s
+  /// `imageStreamFrame` branch is a no-op for that camera.
   final Map<int, StreamController<CameraImageData>> _imageStreamControllers =
       {};
 
   /// Handles method calls from the native side (events pushed to Dart).
+  ///
+  /// Dispatches `cameraError`, `cameraClosing`, and `imageStreamFrame`
+  /// events from native code into the appropriate Dart stream controllers.
   Future<dynamic> _handleNativeCall(MethodCall call) async {
     final args = call.arguments as Map<Object?, Object?>?;
     switch (call.method) {
@@ -104,15 +140,10 @@ class CameraDesktopPlugin extends CameraPlatform {
     }
   }
 
-  // -- Helper --
-
+  /// Filters the global event stream to events for a specific [cameraId].
   Stream<CameraEvent> _cameraEvents(int cameraId) => _eventStreamController
       .stream
       .where((CameraEvent e) => e.cameraId == cameraId);
-
-  // ---------------------------------------------------------------------------
-  // Camera discovery
-  // ---------------------------------------------------------------------------
 
   @override
   Future<List<CameraDescription>> availableCameras() async {
@@ -129,10 +160,6 @@ class CameraDesktopPlugin extends CameraPlatform {
     }).toList();
   }
 
-  // ---------------------------------------------------------------------------
-  // Camera lifecycle
-  // ---------------------------------------------------------------------------
-
   @override
   Future<int> createCamera(
     CameraDescription cameraDescription,
@@ -148,12 +175,37 @@ class CameraDesktopPlugin extends CameraPlatform {
     );
   }
 
+  /// Creates a camera with the given [mediaSettings].
+  ///
+  /// The `videoBitrate` and `audioBitrate` fields are accessed via dynamic
+  /// dispatch with try/catch because older versions of
+  /// `camera_platform_interface` may not expose them.
   @override
   Future<int> createCameraWithSettings(
     CameraDescription cameraDescription,
     MediaSettings mediaSettings,
   ) async {
     _ensureNativeCallHandler();
+    int? videoBitrate;
+    try {
+      final dynamic dynamicSettings = mediaSettings;
+      final dynamic value = dynamicSettings.videoBitrate;
+      if (value is int) {
+        videoBitrate = value;
+      } else if (value is num) {
+        videoBitrate = value.toInt();
+      }
+    } catch (_) {}
+    int? audioBitrate;
+    try {
+      final dynamic dynamicSettings = mediaSettings;
+      final dynamic value = dynamicSettings.audioBitrate;
+      if (value is int) {
+        audioBitrate = value;
+      } else if (value is num) {
+        audioBitrate = value.toInt();
+      }
+    } catch (_) {}
     try {
       final result = await _channel.invokeMapMethod<String, dynamic>('create', {
         'cameraName': cameraDescription.name,
@@ -161,6 +213,8 @@ class CameraDesktopPlugin extends CameraPlatform {
             mediaSettings.resolutionPreset?.index ?? ResolutionPreset.max.index,
         'enableAudio': mediaSettings.enableAudio,
         'fps': mediaSettings.fps,
+        'videoBitrate': ?videoBitrate,
+        'audioBitrate': ?audioBitrate,
       });
       final cameraId = result!['cameraId'] as int;
       final textureId = result['textureId'] as int;
@@ -200,12 +254,15 @@ class CameraDesktopPlugin extends CameraPlatform {
     }
   }
 
+  /// Disposes the camera and releases all associated resources.
+  ///
+  /// Platform exceptions during disposal are silently ignored to ensure
+  /// cleanup always completes.
   @override
   Future<void> dispose(int cameraId) async {
     try {
       await _channel.invokeMethod<void>('dispose', {'cameraId': cameraId});
-    } on PlatformException {
-      // Ignore errors during disposal.
+    } on PlatformException catch (_) {
     } finally {
       _textureIds.remove(cameraId);
       final imageController = _imageStreamControllers.remove(cameraId);
@@ -214,10 +271,6 @@ class CameraDesktopPlugin extends CameraPlatform {
       }
     }
   }
-
-  // ---------------------------------------------------------------------------
-  // Event streams
-  // ---------------------------------------------------------------------------
 
   @override
   Stream<CameraInitializedEvent> onCameraInitialized(int cameraId) =>
@@ -246,10 +299,12 @@ class CameraDesktopPlugin extends CameraPlatform {
         const DeviceOrientationChangedEvent(DeviceOrientation.landscapeLeft),
       );
 
-  // ---------------------------------------------------------------------------
-  // Preview
-  // ---------------------------------------------------------------------------
-
+  /// Builds the camera preview widget for the given [cameraId].
+  ///
+  /// On macOS and Linux the native backend mirrors the texture, so the
+  /// [Texture] widget is returned as-is. On Windows, IMFCaptureEngine does
+  /// not mirror natively, so the texture is wrapped in a horizontal
+  /// [Transform] flip.
   @override
   Widget buildPreview(int cameraId) {
     final textureId = _textureIds[cameraId];
@@ -260,7 +315,13 @@ class CameraDesktopPlugin extends CameraPlatform {
             'Was createCamera called?',
       );
     }
-    return Texture(textureId: textureId);
+    final texture = Texture(textureId: textureId);
+    if (!Platform.isWindows) return texture;
+    return Transform(
+      alignment: Alignment.center,
+      transform: Matrix4.diagonal3Values(-1, 1, 1),
+      child: texture,
+    );
   }
 
   @override
@@ -283,71 +344,98 @@ class CameraDesktopPlugin extends CameraPlatform {
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Mirror control
-  // ---------------------------------------------------------------------------
-
   /// Toggles horizontal mirroring on the live camera feed.
   ///
   /// On macOS, this sets `isVideoMirrored` on the AVCaptureConnection.
   /// On Linux, this toggles the `videoflip` GStreamer element's method.
-  /// On Windows, this is a no-op (mirror is handled at the Dart/app level).
+  /// On Windows, this returns a platform `unsupported` error.
   ///
   /// Can be called while the camera is running — no restart needed.
+  /// Silently ignored via [MissingPluginException] if the native side
+  /// has no handler for this platform.
   Future<void> setMirror(int cameraId, bool mirrored) async {
     try {
       await _channel.invokeMethod<void>('setMirror', {
         'cameraId': cameraId,
         'mirrored': mirrored,
       });
-    } on MissingPluginException {
-      // No native handler on this platform (e.g., Windows) — silently ignore.
+    } on MissingPluginException catch (_) {
     } on PlatformException catch (e) {
       throw CameraException(e.code, e.message);
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Image streaming
-  // ---------------------------------------------------------------------------
-
   @override
   bool supportsImageStreaming() => true;
 
+  /// Returns a stream of [CameraImageData] frames from the camera.
+  ///
+  /// Image delivery uses a two-path architecture:
+  /// 1. **FFI path** (preferred): reads directly from a native shared buffer
+  ///    via `dart:ffi` for minimal copies (1 per frame). When active, frames
+  ///    bypass [_imageStreamControllers] entirely, so `_handleNativeCall`'s
+  ///    `imageStreamFrame` branch is a no-op for that camera.
+  /// 2. **MethodChannel fallback**: if FFI setup fails (symbols not found),
+  ///    frames are delivered through `_handleNativeCall` and stored in
+  ///    [_imageStreamControllers].
+  ///
+  /// The stream handle returned by native `startImageStream` may be an int
+  /// directly or a map containing a `streamHandle` key. Falls back to
+  /// [cameraId] for backward compatibility with older native implementations.
   @override
   Stream<CameraImageData> onStreamedFrameAvailable(
     int cameraId, {
     CameraImageStreamOptions? options,
   }) {
-    final ffi = ImageStreamFfi.tryCreate(cameraId);
+    int extractStreamHandle(dynamic value) {
+      if (value is int) return value;
+      if (value is Map<dynamic, dynamic>) {
+        final dynamic raw = value['streamHandle'];
+        if (raw is int) return raw;
+      }
+      return cameraId;
+    }
+
+    ImageStreamFfi? ffi;
+    int streamHandle = cameraId;
     late final StreamController<CameraImageData> controller;
 
     controller = StreamController<CameraImageData>(
-      onListen: () {
-        _channel.invokeMethod<void>('startImageStream', {'cameraId': cameraId});
-        ffi?.start(controller);
+      onListen: () async {
+        final dynamic value = await _channel.invokeMethod<dynamic>(
+          'startImageStream',
+          {'cameraId': cameraId},
+        );
+        streamHandle = extractStreamHandle(value);
+        ffi = ImageStreamFfi.tryCreate(streamHandle);
+        if (ffi == null) {
+          _imageStreamControllers[cameraId] = controller;
+        } else {
+          ffi!.start(controller);
+        }
       },
-      onCancel: () {
+      onCancel: () async {
         ffi?.stop();
         ffi?.dispose();
         _imageStreamControllers.remove(cameraId);
-        _channel.invokeMethod<void>('stopImageStream', {'cameraId': cameraId});
+        await _channel.invokeMethod<void>('stopImageStream', {
+          'cameraId': cameraId,
+          'streamHandle': streamHandle,
+        });
+      },
+      onPause: () {
+        debugPrint(
+          '[camera_desktop] Warning: pausing image stream '
+          'subscription has no effect — native frames continue flowing.',
+        );
+      },
+      onResume: () {
+        debugPrint('[camera_desktop] Image stream subscription resumed.');
       },
     );
 
-    if (ffi == null) {
-      // Fallback: use MethodChannel path for frame delivery.
-      _imageStreamControllers[cameraId] = controller;
-    }
-    // When FFI is active, don't register in _imageStreamControllers so that
-    // _handleNativeCall("imageStreamFrame") is a no-op for this camera.
-
     return controller.stream;
   }
-
-  // ---------------------------------------------------------------------------
-  // Image capture
-  // ---------------------------------------------------------------------------
 
   @override
   Future<XFile> takePicture(int cameraId) async {
@@ -361,13 +449,19 @@ class CameraDesktopPlugin extends CameraPlatform {
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Video recording
-  // ---------------------------------------------------------------------------
+  /// No-op on desktop — no preparation needed before recording.
+  @override
+  Future<void> prepareForVideoRecording() async {}
 
   @override
-  Future<void> prepareForVideoRecording() async {
-    // No-op on desktop.
+  Future<void> startVideoCapturing(VideoCaptureOptions options) async {
+    if (options.streamCallback != null) {
+      throw CameraException(
+        'startVideoCapturing',
+        'Simultaneous recording and streaming via streamCallback is not yet supported on desktop. Use onStreamedFrameAvailable() and startVideoRecording() separately.',
+      );
+    }
+    await startVideoRecording(options.cameraId);
   }
 
   @override
@@ -389,10 +483,41 @@ class CameraDesktopPlugin extends CameraPlatform {
   @override
   Future<XFile> stopVideoRecording(int cameraId) async {
     try {
-      final path = await _channel.invokeMethod<String>('stopVideoRecording', {
-        'cameraId': cameraId,
-      });
-      return XFile(path!);
+      final dynamic value = await _channel.invokeMethod<dynamic>(
+        'stopVideoRecording',
+        {'cameraId': cameraId},
+      );
+      if (value is String) {
+        return XFile(value);
+      }
+      final map = value as Map<dynamic, dynamic>;
+      final path = map['path'] as String?;
+      if (path == null || path.isEmpty) {
+        throw CameraException(
+          'stopVideoRecording',
+          'Native stopVideoRecording returned no output path.',
+        );
+      }
+      final width = map['width'] as int?;
+      final height = map['height'] as int?;
+      final fps = map['fps'] as int?;
+      final bitrate = map['bitrate'] as int?;
+      final container = map['container'] as String?;
+      final videoCodec = map['videoCodec'] as String?;
+      final audioCodec = map['audioCodec'] as String?;
+      if (width != null && height != null && fps != null && bitrate != null) {
+        debugPrint(
+          '[camera_desktop] Video recorded: ${width}x$height @ ${fps}fps, '
+          'bitrate=${bitrate}bps, path=$path',
+        );
+      }
+      if (container != null || videoCodec != null || audioCodec != null) {
+        debugPrint(
+          '[camera_desktop] Format: container=$container, '
+          'video=$videoCodec, audio=$audioCodec',
+        );
+      }
+      return XFile(path);
     } on PlatformException catch (e) {
       throw CameraException(e.code, e.message);
     }
@@ -414,14 +539,11 @@ class CameraDesktopPlugin extends CameraPlatform {
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // Camera controls (Phase 3 — sensible defaults / unsupported)
-  // ---------------------------------------------------------------------------
-
+  /// No-op for [FlashMode.off]; desktop cameras typically lack flash hardware.
   @override
   Future<void> setFlashMode(int cameraId, FlashMode mode) async {
     if (mode == FlashMode.off) {
-      return; // No-op; desktop cameras typically lack flash.
+      return;
     }
     throw CameraException(
       'setFlashMode',
@@ -429,9 +551,10 @@ class CameraDesktopPlugin extends CameraPlatform {
     );
   }
 
+  /// No-op for [ExposureMode.auto] (the default); throws otherwise.
   @override
   Future<void> setExposureMode(int cameraId, ExposureMode mode) async {
-    if (mode == ExposureMode.auto) return; // No-op; auto is the default.
+    if (mode == ExposureMode.auto) return;
     throw CameraException(
       'setExposureMode',
       'Exposure mode control is not supported on desktop.',
@@ -458,9 +581,10 @@ class CameraDesktopPlugin extends CameraPlatform {
   @override
   Future<double> setExposureOffset(int cameraId, double offset) async => 0.0;
 
+  /// No-op for [FocusMode.auto] (the default); throws otherwise.
   @override
   Future<void> setFocusMode(int cameraId, FocusMode mode) async {
-    if (mode == FocusMode.auto) return; // No-op; auto is the default.
+    if (mode == FocusMode.auto) return;
     throw CameraException(
       'setFocusMode',
       'Focus mode control is not supported on desktop.',
@@ -491,26 +615,16 @@ class CameraDesktopPlugin extends CameraPlatform {
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Orientation (no-op on desktop)
-  // ---------------------------------------------------------------------------
-
+  /// No-op on desktop — orientation locking is not applicable.
   @override
   Future<void> lockCaptureOrientation(
     int cameraId,
     DeviceOrientation orientation,
-  ) async {
-    // No-op on desktop.
-  }
+  ) async {}
 
+  /// No-op on desktop — orientation locking is not applicable.
   @override
-  Future<void> unlockCaptureOrientation(int cameraId) async {
-    // No-op on desktop.
-  }
-
-  // ---------------------------------------------------------------------------
-  // Miscellaneous
-  // ---------------------------------------------------------------------------
+  Future<void> unlockCaptureOrientation(int cameraId) async {}
 
   @override
   Future<void> setDescriptionWhileRecording(
