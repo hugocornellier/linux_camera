@@ -1,5 +1,31 @@
 import Foundation
 
+typealias ImageStreamCallback = @convention(c) (Int32) -> Void
+
+@_cdecl("camera_desktop_image_stream_noop_callback")
+private func cameraDesktopImageStreamNoopCallback(_ cameraId: Int32) {
+    _ = cameraId
+}
+
+@_cdecl("camera_desktop_get_image_stream_buffer")
+private func cameraDesktopGetImageStreamBuffer(_ streamHandle: Int64) -> UnsafeMutableRawPointer? {
+    ImageStreamHandleBridge.getImageStreamBuffer(forHandle: streamHandle)
+}
+
+@_cdecl("camera_desktop_register_image_stream_callback")
+private func cameraDesktopRegisterImageStreamCallback(
+    _ streamHandle: Int64,
+    _ callback: ImageStreamCallback?
+) {
+    guard let callback else { return }
+    ImageStreamHandleBridge.registerImageStreamCallback(callback, forHandle: streamHandle)
+}
+
+@_cdecl("camera_desktop_unregister_image_stream_callback")
+private func cameraDesktopUnregisterImageStreamCallback(_ streamHandle: Int64) {
+    ImageStreamHandleBridge.unregisterImageStreamCallback(forHandle: streamHandle)
+}
+
 private final class WeakCameraSession {
     weak var value: CameraSession?
 
@@ -8,8 +34,7 @@ private final class WeakCameraSession {
     }
 }
 
-@objcMembers
-public final class ImageStreamHandleBridge: NSObject {
+final class ImageStreamHandleBridge {
     private static var nextHandle: Int64 = 1
     private static var sessionsByHandle: [Int64: WeakCameraSession] = [:]
     private static var cameraIdByHandle: [Int64: Int] = [:]
@@ -25,7 +50,7 @@ public final class ImageStreamHandleBridge: NSObject {
         return handle
     }
 
-    public static func releaseHandle(_ handle: Int64) {
+    static func releaseHandle(_ handle: Int64) {
         if handle == 0 { return }
         lock.lock()
         sessionsByHandle.removeValue(forKey: handle)
@@ -45,7 +70,7 @@ public final class ImageStreamHandleBridge: NSObject {
         }
     }
 
-    public static func getImageStreamBuffer(forHandle handle: Int64) -> UnsafeMutableRawPointer? {
+    static func getImageStreamBuffer(forHandle handle: Int64) -> UnsafeMutableRawPointer? {
         lock.lock()
         let session = sessionsByHandle[handle]?.value
         if session == nil {
@@ -56,8 +81,8 @@ public final class ImageStreamHandleBridge: NSObject {
         return session?.getImageStreamBufferPointer()
     }
 
-    public static func registerImageStreamCallback(
-        _ callback: @convention(c) (Int32) -> Void,
+    static func registerImageStreamCallback(
+        _ callback: ImageStreamCallback,
         forHandle handle: Int64
     ) {
         lock.lock()
@@ -70,7 +95,7 @@ public final class ImageStreamHandleBridge: NSObject {
         session?.registerImageStreamCallback(callback)
     }
 
-    public static func unregisterImageStreamCallback(forHandle handle: Int64) {
+    static func unregisterImageStreamCallback(forHandle handle: Int64) {
         lock.lock()
         let session = sessionsByHandle[handle]?.value
         if session == nil {

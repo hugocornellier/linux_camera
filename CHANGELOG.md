@@ -1,3 +1,7 @@
+## 1.0.4
+
+* Fix macOS Swift Package Manager compatibility
+
 ## 1.0.3
 
 * Fix hot restart FFI crash by replacing NativeCallable with polling
