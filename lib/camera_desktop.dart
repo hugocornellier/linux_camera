@@ -7,4 +7,3 @@
 library;
 
 export 'src/camera_desktop_plugin.dart';
-export 'src/camera_desktop_stub.dart';

@@ -1,3 +1,7 @@
+## 1.0.5
+
+* Fixes #1: conflict with camera_android and camera_avfoundation dependencies
+
 ## 1.0.4
 
 * Fix macOS Swift Package Manager compatibility
